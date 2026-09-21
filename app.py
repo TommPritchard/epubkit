@@ -1,6 +1,7 @@
 """
 FastAPI application for epubkit — EPUB optimizer for e-ink readers.
 Handles: file upload, metadata preview, SSE progress streaming, file download.
+Secured for private Reading Ledger integration.
 """
 
 import os
@@ -16,6 +17,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 
 from epub_processor import process_epub, extract_epub_metadata, ProcessingOptions, ProcessingReport
@@ -23,6 +25,48 @@ from image_processor import DEVICE_PROFILES
 from metadata_handler import FILENAME_FORMATS, format_filename
 
 app = FastAPI(title="epubkit")
+
+# Secret API key from environment variable
+CONVERTER_API_KEY = os.environ.get("CONVERTER_API_KEY", "")
+
+# 1. Enable CORS for Reading Ledger web app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 2. Security Middleware: verify API Key on all non-health requests
+@app.middleware("http")
+async def verify_api_key(request: Request, call_next):
+    # Always allow CORS preflight requests
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # Health check is open for waking up the container
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    # If an API key is configured, protect all other endpoints
+    if CONVERTER_API_KEY:
+        token = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+        if token != CONVERTER_API_KEY:
+            # Return 404 to mask the service from public visitors
+            return HTMLResponse(
+                "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>",
+                status_code=404
+            )
+
+    return await call_next(request)
+
+
+# Health check endpoint for wake-up ping
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "reading-ledger-converter"}
+
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -63,6 +107,11 @@ async def cleanup_old_files():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    # Mask index page from public browser visitors if API key is active
+    if CONVERTER_API_KEY:
+        token = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+        if token != CONVERTER_API_KEY:
+            return HTMLResponse("<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>", status_code=404)
     return templates.TemplateResponse("index.html", {"request": request})
 
 
@@ -149,6 +198,7 @@ async def process_sse(
     edit_author: str = "",
     filename_format: str = "author-title",
     filename_template: str = "",
+    api_key: str = ""
 ):
     """SSE endpoint that streams processing progress."""
     if task_id not in tasks:
@@ -220,7 +270,6 @@ async def process_sse(
         })
 
     async def generate():
-        # Start processing in thread pool
         future = loop.run_in_executor(
             executor,
             process_epub,
@@ -240,10 +289,8 @@ async def process_sse(
             except asyncio.TimeoutError:
                 yield f": keepalive\n\n"
 
-        # Wait for the processing to complete and get the report
         report: ProcessingReport = await future
 
-        # Send final report
         final = {
             "percent": 100,
             "message": "Complete" if report.success else f"Error: {report.error}",
@@ -288,7 +335,7 @@ async def process_sse(
 
 
 @app.get("/download/{task_id}")
-async def download_file(task_id: str):
+async def download_file(task_id: str, api_key: str = ""):
     """Download the processed EPUB file."""
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -311,7 +358,7 @@ async def download_file(task_id: str):
 
 
 @app.get("/download-all")
-async def download_all(task_ids: str):
+async def download_all(task_ids: str, api_key: str = ""):
     """Download multiple processed EPUBs as a ZIP. task_ids is comma-separated."""
     import zipfile
     ids = [t.strip() for t in task_ids.split(',') if t.strip()]
@@ -319,7 +366,6 @@ async def download_all(task_ids: str):
     if not ids:
         raise HTTPException(status_code=400, detail="No task IDs provided")
 
-    # Create ZIP file
     zip_dir = OUTPUT_DIR / "batch"
     zip_dir.mkdir(parents=True, exist_ok=True)
     zip_path = str(zip_dir / f"epubkit_optimized_{uuid.uuid4().hex[:8]}.zip")
