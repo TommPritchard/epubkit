@@ -1,552 +1,438 @@
-"""
-Image processor for Xteink EPUB Optimizer.
-Handles: baseline JPEG conversion, resize, chromatic-aware grayscale,
-adaptive e-ink tone mapping (shadow lift, dead-zone anti-speckle clamping,
-unsharp masking), 4-level Floyd-Steinberg quantization, and Light Novel mode.
-
-Device profiles (display orientation, portrait):
-  X4 (SSD1677 controller):
-    - Display: 480x800, 4-level grayscale (black, dark gray, light gray, white)
-  X3 (SSD1677 controller):
-    - Display: 528x792, same 4-level grayscale hardware
-    - Note: stock X3 firmware does not render EPUB images at all; image
-      output targets CrossPoint-family firmware
-  Both:
-    - Max image: 1024x1024
-    - RAM: 380KB — smaller images = faster rendering
-"""
-
+from PIL import Image, ImageFilter
 import io
-from pathlib import Path
-from dataclasses import dataclass, field
-
-from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageDraw, ImageFont
+import math
+from typing import Tuple, Dict
 
 
-# Device screen profiles in display orientation (portrait), matching the
-# CrossPoint reference converter (X4: 480x800, X3: 528x792). The panels scan
-# in landscape (e.g. 800x480) but the readers display portrait — and render
-# images at native size without upscaling, so images sized to the old
-# landscape box drew as a small box instead of filling the screen.
-DEVICE_PROFILES = {
-    'x4': {
-        'width': 480,
-        'height': 800,
-        # SSD1677 4-level grayscale: black, dark gray, light gray, white
-        'gray_levels': [0, 85, 170, 255],
-        'label': 'Xteink X4',
-    },
-    'x3': {
-        'width': 528,
-        'height': 792,
-        # Same SSD1677 4-level grayscale as the X4. Stock X3 firmware does
-        # not render EPUB images at all (hardware-verified), so image output
-        # targets CrossPoint-family firmware, which renders grayscale.
-        'gray_levels': [0, 85, 170, 255],
-        'label': 'Xteink X3',
-    },
-}
-DEFAULT_DEVICE = 'x4'
+class ImageProcessor:
+    @staticmethod
+    def _to_eink_grayscale(img: Image.Image) -> Image.Image:
+        """
+        Convert RGB/RGBA/P image to grayscale ('L') using a chromatic-aware blend:
+        80% ITU-R 601-2 perceptual luma + 20% HSV Value (max(R, G, B)).
+        Preserves saturated reds, golds, and warm skin tones against dark shadows.
+        """
+        if img.mode == 'L':
+            return img.copy()
 
-# X4 display dimensions (portrait), used as defaults
-X4_WIDTH = DEVICE_PROFILES['x4']['width']
-X4_HEIGHT = DEVICE_PROFILES['x4']['height']
+        if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+            rgba = img.convert('RGBA')
+            bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(bg, rgba).convert('RGB')
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
 
-# Hard limit per Xteink JPEG spec
-MAX_IMAGE_DIMENSION = 1024
+        r_band, g_band, b_band = img.split()
+        r_px = r_band.getdata()
+        g_px = g_band.getdata()
+        b_px = b_band.getdata()
 
-# Default palette (X4)
-EINK_PALETTE_LEVELS = DEVICE_PROFILES['x4']['gray_levels']
+        out_px = [
+            min(
+                255,
+                int(
+                    (0.299 * r + 0.587 * g + 0.114 * b) * 0.80
+                    + (r if r >= g and r >= b else (g if g >= b else b)) * 0.20
+                    + 0.5
+                ),
+            )
+            for r, g, b in zip(r_px, g_px, b_px)
+        ]
 
-SUPPORTED_EXTENSIONS = {'.png', '.gif', '.webp', '.bmp', '.jpeg', '.jpg', '.tif', '.tiff'}
+        gray = Image.new('L', img.size)
+        gray.putdata(out_px)
+        return gray
 
+    @staticmethod
+    def _fit_cover_smart_hybrid(
+        gray_img: Image.Image, target_w: int = 480, target_h: int = 800
+    ) -> Image.Image:
+        """
+        Smart Hybrid 480x800 full-screen cover fitting for Xteink X4 (3:5 aspect ratio):
+        1. Scans the outer 3.5% left & right margins for high-contrast typography/strokes
+           so edge-to-edge titles (e.g. 'LARRY KRAMER / FAGGOTS') are never clipped.
+        2. Checks whether the top or bottom border is a uniform solid background (std < 10)
+           that can be seamlessly extended by up to 22px with zero visible seam.
+        3. Absorbs the remaining small aspect difference via smooth Lanczos scaling to
+           produce an exact (target_w, target_h) full-screen cover image.
+        """
+        sw, sh = gray_img.size
+        if sw <= 0 or sh <= 0:
+            return gray_img
+        if sw == target_w and sh == target_h:
+            return gray_img
 
-@dataclass
-class ImageOptions:
-    grayscale: bool = True
-    contrast_boost: bool = True
-    contrast_factor: float = 1.5  # Higher default for low-bit-depth displays
-    quality: int = 70
-    max_width: int = X4_WIDTH
-    max_height: int = X4_HEIGHT
-    eink_quantize: bool = True  # Quantize to device gray levels
-    gray_levels: list = field(default_factory=lambda: list(EINK_PALETTE_LEVELS))
-    light_novel_mode: bool = False
-    light_novel_rotate_left: bool = True
-    is_cover: bool = False
+        target_ratio = float(target_w) / float(target_h)
+        src_ratio = float(sw) / float(sh)
 
-    @classmethod
-    def for_device(cls, device: str, **overrides) -> 'ImageOptions':
-        """Build options from a device profile ('x4' or 'x3')."""
-        profile = DEVICE_PROFILES.get(device, DEVICE_PROFILES[DEFAULT_DEVICE])
-        defaults = {
-            'max_width': profile['width'],
-            'max_height': profile['height'],
-            'gray_levels': list(profile['gray_levels']),
-        }
-        defaults.update(overrides)
-        return cls(**defaults)
+        if abs(src_ratio - target_ratio) <= 0.012:
+            return gray_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
+        px = list(gray_img.getdata())
 
-@dataclass
-class ImageResult:
-    output_bytes: bytes
-    new_filename: str
-    original_size: int
-    new_size: int
-    was_converted: bool
-    details: str
+        if src_ratio > target_ratio:
+            # 1. Measure safe stroke-free horizontal margin on left and right (up to 3.5% each side)
+            max_margin_px = max(1, int(round(sw * 0.035)))
+            ref_offset = min(sw // 6, max_margin_px * 3)
+            y_start = int(sh * 0.04)
+            y_end = int(sh * 0.96)
+            y_step = max(1, sh // 250)
+            hit_threshold = max(2, (y_end - y_start) // (y_step * 45))
 
+            safe_left = max_margin_px
+            for x in range(2, max_margin_px):
+                hits = 0
+                for y in range(y_start, y_end, y_step):
+                    bg = px[y * sw + ref_offset]
+                    if abs(px[y * sw + x] - bg) > 65:
+                        hits += 1
+                if hits > hit_threshold:
+                    safe_left = max(0, x - 4)
+                    break
 
-def should_process(filename: str) -> bool:
-    """Check if a file is a processable image based on extension."""
-    return Path(filename).suffix.lower() in SUPPORTED_EXTENSIONS
+            safe_right = max_margin_px
+            for x in range(2, max_margin_px):
+                rx = sw - 1 - x
+                hits = 0
+                for y in range(y_start, y_end, y_step):
+                    bg = px[y * sw + (sw - 1 - ref_offset)]
+                    if abs(px[y * sw + rx] - bg) > 65:
+                        hits += 1
+                if hits > hit_threshold:
+                    safe_right = max(0, x - 4)
+                    break
 
+            # Cap horizontal trim to what is actually needed when combined with ~5% vertical stretch
+            ideal_scaled_w = max(target_w, int(round((target_h * src_ratio) / 1.05)))
+            max_needed_sym_crop = int(round(sw * ((ideal_scaled_w - target_w) / float(2 * ideal_scaled_w))))
+            safe_sym_crop = min(safe_left, safe_right, max(max_margin_px, max_needed_sym_crop))
+            crop_w = max(16, sw - 2 * safe_sym_crop)
 
-def is_progressive_jpeg(image_bytes: bytes) -> bool:
-    """Check if JPEG data is progressive/interlaced."""
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        if img.format != 'JPEG':
-            return False
-        return img.info.get('progressive', False) or img.info.get('progression', False)
-    except Exception:
-        return False
+            # 2. Check if top or bottom border is a uniform solid dark/light background
+            top_vals = []
+            bot_vals = []
+            top_row = min(sh - 1, 2)
+            bot_row = max(0, sh - 3)
+            for x in range(safe_sym_crop + 4, sw - safe_sym_crop - 4, max(1, crop_w // 120)):
+                top_vals.append(px[top_row * sw + x])
+                bot_vals.append(px[bot_row * sw + x])
 
+            def _mean_std(vals):
+                if not vals:
+                    return 128.0, 999.0
+                m = sum(vals) / float(len(vals))
+                var = sum((v - m) ** 2 for v in vals) / float(len(vals))
+                return m, math.sqrt(max(0.0, var))
 
-def _to_eink_grayscale(img: Image.Image) -> Image.Image:
-    """
-    Convert an image to grayscale while preserving chromatic contrast.
-    Standard ITU-R 601-2 luma (0.299R + 0.587G + 0.114B) maps saturated reds
-    and deep blues to very dark values, causing colored titles or details on
-    dark book covers to collapse into black. Blending 80% standard luma with
-    20% HSV Value (max(R, G, B)) keeps neutral grays identical while giving
-    saturated colors natural separation on 4-level e-ink.
-    """
-    if img.mode == 'L':
-        return img
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
+            top_mean, top_std = _mean_std(top_vals)
+            bot_mean, bot_std = _mean_std(bot_vals)
 
-    std_l = img.convert('L')
-    r, g, b = img.split()
-    max_rgb = ImageChops.lighter(ImageChops.lighter(r, g), b)
-    return Image.blend(std_l, max_rgb, 0.20)
+            top_is_uniform = (top_std < 10.0) and (top_mean <= 22.0 or top_mean >= 235.0)
+            bot_is_uniform = (bot_std < 10.0) and (bot_mean <= 22.0 or bot_mean >= 235.0)
 
+            cropped_ratio = float(crop_w) / float(sh)
+            natural_h = int(round(target_w / cropped_ratio))
+            deficit_h = max(0, target_h - natural_h)
 
-def _enhance_for_eink(gray_img: Image.Image, options: ImageOptions) -> Image.Image:
-    """
-    Adaptive histogram-driven tone mapping and micro-contrast sharpening
-    designed specifically for 4-level (SSD1677) e-ink quantization.
+            pad_top = 0
+            pad_bot = 0
+            if deficit_h > 0:
+                if top_is_uniform and bot_is_uniform:
+                    pad_top = min(20, deficit_h // 3)
+                    pad_bot = min(20, deficit_h // 3)
+                elif top_is_uniform:
+                    pad_top = min(22, deficit_h // 3)
+                elif bot_is_uniform:
+                    pad_bot = min(22, deficit_h // 3)
 
-    Replaces the naive linear Contrast(1.5) stretch (which hard-clipped the
-    bottom 33% of shadows to 0 and top 33% of highlights to 255) with:
-      1. Percentile histogram normalization (0.5% cutoff)
-      2. Automatic classification between bimodal line-art/diagrams and
-         continuous-tone artwork/covers/photos
-      3. Dead-zone black/white clamping (eliminating stray dither speckles on
-         solid black or cream/white backgrounds)
-      4. Smooth continuous shadow-lift curve so dark chiaroscuro details map
-         into the 85 and 170 gray levels instead of crushing to 0
-      5. Post-resize UnsharpMask so small cover typography and map labels stay
-         razor-sharp through Floyd-Steinberg dithering
-    """
-    hist = gray_img.histogram()
-    total = sum(hist)
-    if total <= 0:
-        return gray_img
+            draw_h = max(16, target_h - pad_top - pad_bot)
+            cropped_img = gray_img.crop((safe_sym_crop, 0, safe_sym_crop + crop_w, sh))
+            scaled_body = cropped_img.resize((target_w, draw_h), Image.Resampling.LANCZOS)
 
-    # 1. Find 0.5% and 99.5% percentiles for gentle dynamic range normalization
-    cutoff = int(total * 0.005)
-    lo = 0
-    hi = 255
-    acc = 0
-    for i in range(256):
-        acc += hist[i]
-        if acc > cutoff:
-            lo = i
-            break
-    acc = 0
-    for i in range(255, -1, -1):
-        acc += hist[i]
-        if acc > cutoff:
-            hi = i
-            break
-    if hi <= lo:
-        lo, hi = 0, 255
+            if pad_top == 0 and pad_bot == 0:
+                return scaled_body
 
-    # 2. Compute post-stretch luminance distribution statistics
-    span = float(hi - lo)
-    weighted_sum = 0.0
-    dark_count = 0
-    bright_count = 0
-    mid_count = 0
+            canvas = Image.new('L', (target_w, target_h), 0)
+            if pad_top > 0:
+                top_fill = 0 if top_mean <= 22.0 else 255
+                canvas.paste(top_fill, (0, 0, target_w, pad_top + 2))
+            if pad_bot > 0:
+                bot_fill = 0 if bot_mean <= 22.0 else 255
+                canvas.paste(bot_fill, (0, pad_top + draw_h - 2, target_w, target_h))
+            canvas.paste(scaled_body, (0, pad_top))
+            return canvas
 
-    for i, count in enumerate(hist):
-        if count == 0:
-            continue
-        stretched = max(0.0, min(255.0, (i - lo) * 255.0 / span))
-        weighted_sum += stretched * count
-        if stretched < 64.0:
-            dark_count += count
-        elif stretched > 200.0:
-            bright_count += count
         else:
-            mid_count += count
+            # Narrower than 3:5: apply subtle horizontal stretch (up to 5%) + center vertical trim
+            scaled_h = max(target_h, int(round((target_w / src_ratio) / 1.05)))
+            resized = gray_img.resize((target_w, scaled_h), Image.Resampling.LANCZOS)
+            crop_y = max(0, (scaled_h - target_h) // 2)
+            return resized.crop((0, crop_y, target_w, crop_y + target_h))
 
-    mean_lum = weighted_sum / total
-    bright_ratio = bright_count / total
-    mid_ratio = mid_count / total
+    @staticmethod
+    def _enhance_for_eink(gray_img: Image.Image, options: Dict) -> Tuple[Image.Image, list]:
+        """
+        Adaptive pre-processing for 4-level e-ink screens:
+        1. 0.5% to 99.5% percentile histogram normalization.
+        2. Bimodal detection (line art / text / diagrams vs continuous-tone artwork/covers).
+        3. Dead-zone clamping ([0..7] -> 0, [248..255] -> 255) to eliminate background speckle.
+        4. Adaptive shadow-lift tone curve + highlight roll-up for typography.
+        5. Local Adaptive Contrast (radius=16 broad Gaussian local dodge & burn) so facial
+           features, drapery, and shadow details pop on a 4-shade display without washing
+           out flat backgrounds.
+        6. Fine UnsharpMask prior to 4-level quantization.
+        Returns (sharpened_image, deadzone_mapped_pixels).
+        """
+        w, h = gray_img.size
+        total_pixels = w * h
+        if total_pixels == 0:
+            return gray_img, []
 
-    # Scale relative to user-configured contrast_factor (default 1.5)
-    factor_scale = max(0.5, min(2.0, options.contrast_factor / 1.5))
+        hist = gray_img.histogram()
 
-    # 3. Build 256-entry lookup table
-    lut = [0] * 256
-    is_line_art = (not options.is_cover) and (bright_ratio > 0.58) and (mid_ratio < 0.20)
+        clip_pixels = max(1, int(total_pixels * 0.005))
+        low = 0
+        acc = 0
+        for i, count in enumerate(hist):
+            acc += count
+            if acc > clip_pixels:
+                low = i
+                break
 
-    if is_line_art:
-        # Bimodal diagram / map / line-art on light page background:
-        # Clamp paper background cleanly to white (255) and darken ink strokes
-        line_contrast = 1.35 * factor_scale
+        high = 255
+        acc = 0
+        for i in range(255, -1, -1):
+            acc += hist[i]
+            if acc > clip_pixels:
+                high = i
+                break
+
+        if high <= low + 10:
+            low, high = 0, 255
+
+        extreme_pixels = sum(hist[:32]) + sum(hist[224:])
+        is_bimodal_line_art = (extreme_pixels / total_pixels) > 0.82
+
+        dark_pixels = sum(hist[:90])
+        dark_ratio = dark_pixels / total_pixels
+
+        if is_bimodal_line_art:
+            shadow_lift = 0.0
+        elif dark_ratio > 0.45:
+            shadow_lift = 0.36
+        elif dark_ratio > 0.25:
+            shadow_lift = 0.25
+        else:
+            shadow_lift = 0.15
+
+        user_contrast = float(options.get('contrast_boost', 1.0))
+        span = max(1, high - low)
+
+        lut = []
         for i in range(256):
-            v = max(0.0, min(255.0, (i - lo) * 255.0 / span))
-            if v >= 218.0:
-                lut[i] = 255
-            elif v <= 15.0:
-                lut[i] = 0
-            else:
-                u = v / 218.0
-                # Darken mid-gray anti-aliased strokes so thin lines survive dithering
-                u_darkened = u ** 1.35
-                u_out = (u_darkened - 0.5) * line_contrast + 0.5
-                lut[i] = int(round(max(0.0, min(1.0, u_out)) * 255.0))
-    else:
-        # Continuous-tone cover / painting / photograph:
-        # Stronger shadow lift for dark/chiaroscuro images (mean_lum < 135),
-        # gentler lift for bright covers
-        darkness = max(0.0, min(1.0, (135.0 - mean_lum) / 85.0))
-        shadow_lift = (0.30 + 0.50 * darkness) * factor_scale
-        mid_contrast = 1.0 + 0.10 * factor_scale
-
-        for i in range(256):
-            v = max(0.0, min(255.0, (i - lo) * 255.0 / span))
-
-            # Dead-zone clamping for speckle-free pure black and pure white backgrounds
-            if v <= 6.0:
-                lut[i] = 0
+            v = (i - low) * 255.0 / span
+            if v <= 7.0:
+                lut.append(0)
                 continue
-            if v >= 249.0:
-                lut[i] = 255
+            if v >= 248.0:
+                lut.append(255)
                 continue
 
-            u = (v - 6.0) / (249.0 - 6.0)
+            u = v / 255.0
+            if shadow_lift > 0.0:
+                u = u + shadow_lift * u * ((1.0 - u) ** 1.4)
 
-            # Smooth continuous shadow lift: peaks in deep shadows (~0.25) and
-            # vanishes smoothly at 0.0 and 1.0 with zero boundary seams
-            u_lifted = u + shadow_lift * u * ((1.0 - u) ** 1.4)
+            if not is_bimodal_line_art:
+                s_strength = 0.045 * user_contrast
+                u = u - s_strength * math.sin(2.0 * math.pi * u)
+                if u > 0.78:
+                    u = 0.78 + (u - 0.78) * 1.12
 
-            # Gentle midtone expansion to separate the 85 and 170 gray levels
-            u_contrast = (u_lifted - 0.5) * mid_contrast + 0.5
+            out_v = int(round(max(0.0, min(1.0, u)) * 255.0))
+            lut.append(out_v)
 
-            # Crisp highlight & light-typography roll-up above 0.78
-            if u_contrast > 0.78:
-                t = (u_contrast - 0.78) / 0.22
-                u_contrast = u_contrast + (1.0 - u_contrast) * t * 0.55
+        mapped_img = gray_img.point(lut)
+        mapped_px = list(mapped_img.getdata())
 
-            u_contrast = max(0.0, min(1.0, u_contrast))
-            lut[i] = int(round(u_contrast * 255.0))
+        if is_bimodal_line_art:
+            sharpened = mapped_img.filter(
+                ImageFilter.UnsharpMask(radius=1.0, percent=80, threshold=4)
+            )
+            return sharpened, mapped_px
 
-    mapped = gray_img.point(lut)
+        # Local Adaptive Contrast (Broad Radius=16 Gaussian Local Dodge & Burn)
+        local_mean_img = mapped_img.filter(ImageFilter.GaussianBlur(radius=16))
+        mean_px = list(local_mean_img.getdata())
 
-    # 4. Resolution-native UnsharpMask (applied at target 480x800 resolution)
-    # Keeps small cover quotes, serif typography, and fine linework crisp
-    mapped = mapped.filter(ImageFilter.UnsharpMask(radius=1.2, percent=95, threshold=3))
-    return mapped
-
-
-def _quantize_to_levels(img: Image.Image, levels: list[int]) -> Image.Image:
-    """
-    Quantize grayscale image to the device's e-ink levels with
-    Floyd-Steinberg dithering (e.g. [0, 85, 170, 255] for the SSD1677
-    4-level palette; any level count works, e.g. [0, 255] for 1-bit).
-    Uses PIL's built-in quantize with a custom palette for speed.
-    """
-    # Build a grayscale palette image from the device levels
-    palette_img = Image.new('P', (1, 1))
-    palette = []
-    for level in levels:
-        palette.extend([level, level, level])
-    # Pad palette to 256 entries (required by PIL)
-    palette.extend([0, 0, 0] * (256 - len(levels)))
-    palette_img.putpalette(palette)
-
-    # Quantize with Floyd-Steinberg dithering
-    rgb = img.convert('RGB')
-    quantized = rgb.quantize(colors=len(levels),
-                             palette=palette_img,
-                             dither=Image.Dither.FLOYDSTEINBERG)
-    return quantized.convert('L')
-
-
-def _handle_transparency(img: Image.Image) -> Image.Image:
-    """Composite transparent images onto white background."""
-    if img.mode in ('RGBA', 'LA', 'PA'):
-        background = Image.new('RGB', img.size, (255, 255, 255))
-        if img.mode == 'PA':
-            img = img.convert('RGBA')
-        background.paste(img, mask=img.split()[-1])
-        return background
-    if img.mode == 'P':
-        if 'transparency' in img.info:
-            img = img.convert('RGBA')
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[-1])
-            return background
-        return img.convert('RGB')
-    return img
-
-
-def _handle_light_novel(img: Image.Image, rotate_left: bool) -> list[Image.Image]:
-    """
-    Light Novel mode: if image is landscape (wider than tall),
-    rotate and optionally split for vertical e-reader viewing.
-    """
-    width, height = img.size
-
-    if width <= height:
-        return [img]
-
-    aspect = width / height
-
-    if aspect > 1.8:
-        # Double-page spread — split into two portrait pages
-        mid = width // 2
-        right_half = img.crop((mid, 0, width, height))
-        left_half = img.crop((0, 0, mid, height))
-        return [right_half, left_half]
-    else:
-        angle = 90 if rotate_left else -90
-        rotated = img.rotate(angle, expand=True)
-        return [rotated]
-
-
-def process_image(image_bytes: bytes, filename: str, options: ImageOptions = None) -> list[ImageResult]:
-    """
-    Process a single image for e-ink device optimization.
-    Returns a list of ImageResult (usually 1, but Light Novel mode may split into 2).
-    """
-    if options is None:
-        options = ImageOptions()
-
-    original_size = len(image_bytes)
-    original_ext = Path(filename).suffix.lower()
-    stem = Path(filename).stem
-
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-    except Exception as e:
-        return [ImageResult(
-            output_bytes=image_bytes,
-            new_filename=filename,
-            original_size=original_size,
-            new_size=original_size,
-            was_converted=False,
-            details=f"Skipped (corrupt: {e})"
-        )]
-
-    # Handle animated GIFs — take first frame
-    if getattr(img, 'is_animated', False):
-        img.seek(0)
-
-    # Handle CMYK
-    if img.mode == 'CMYK':
-        img = img.convert('RGB')
-
-    # Handle 1-bit images
-    if img.mode == '1':
-        img = img.convert('L')
-
-    # Handle transparency
-    img = _handle_transparency(img)
-
-    # Ensure RGB mode
-    if img.mode not in ('RGB', 'L'):
-        img = img.convert('RGB')
-
-    # Light Novel mode — handle landscape images
-    if options.light_novel_mode:
-        images = _handle_light_novel(img, options.light_novel_rotate_left)
-    else:
-        images = [img]
-
-    results = []
-    for i, current_img in enumerate(images):
-        details_parts = []
-
-        # Track format conversion
-        if original_ext != '.jpg' and original_ext != '.jpeg':
-            details_parts.append(f"{original_ext.upper().strip('.')}→JPEG")
-
-        orig_w, orig_h = current_img.size
-
-        # Enforce 1024x1024 hard limit (Xteink JPEG spec)
-        if orig_w > MAX_IMAGE_DIMENSION or orig_h > MAX_IMAGE_DIMENSION:
-            current_img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION),
-                                  Image.Resampling.LANCZOS)
-            clamped_w, clamped_h = current_img.size
-            details_parts.append(f"clamped {orig_w}x{orig_h}→{clamped_w}x{clamped_h}")
-            orig_w, orig_h = clamped_w, clamped_h
-
-        # Resize to fit device screen
-        if orig_w > options.max_width or orig_h > options.max_height:
-            current_img.thumbnail((options.max_width, options.max_height),
-                                  Image.Resampling.LANCZOS)
-            new_w, new_h = current_img.size
-            details_parts.append(f"resized {orig_w}x{orig_h}→{new_w}x{new_h}")
-
-        # Convert to grayscale
-        if options.grayscale:
-            current_img = _to_eink_grayscale(current_img)
-
-            # Contrast & tone-mapping enhancement (before quantization)
-            if options.contrast_boost:
-                if options.eink_quantize:
-                    current_img = _enhance_for_eink(current_img, options)
-                else:
-                    enhancer = ImageEnhance.Contrast(current_img)
-                    current_img = enhancer.enhance(options.contrast_factor)
-
-            # Quantize to device e-ink levels with dithering
-            if options.eink_quantize:
-                current_img = _quantize_to_levels(current_img, options.gray_levels)
-                if len(options.gray_levels) == 2:
-                    details_parts.append("B/W dithered")
-                else:
-                    details_parts.append(f"{len(options.gray_levels)}-level grayscale")
+        local_enhanced_px = [0] * total_pixels
+        for i in range(total_pixels):
+            m = mapped_px[i]
+            if m <= 6 or m >= 249:
+                local_enhanced_px[i] = m
+                continue
+            mean_val = mean_px[i]
+            diff = m - mean_val
+            if mean_val < 35:
+                tone_weight = max(0.0, (mean_val - 10.0) / 25.0)
+            elif mean_val > 200:
+                tone_weight = max(0.0, (245.0 - mean_val) / 45.0)
             else:
-                details_parts.append("grayscale")
+                tone_weight = 1.0
+            boosted = m + 0.50 * tone_weight * diff
+            local_enhanced_px[i] = min(255, max(0, int(round(boosted))))
 
-            if options.contrast_boost:
-                details_parts.append("e-ink adaptive tone-mapped" if options.eink_quantize else f"contrast {options.contrast_factor}x")
+        local_img = Image.new('L', (w, h))
+        local_img.putdata(local_enhanced_px)
 
-            # Convert back to RGB for hardware decoder compatibility
-            current_img = current_img.convert('RGB')
-
-        elif options.contrast_boost:
-            # Contrast without grayscale
-            enhancer = ImageEnhance.Contrast(current_img)
-            current_img = enhancer.enhance(options.contrast_factor)
-            details_parts.append(f"contrast {options.contrast_factor}x")
-
-        # Save as baseline JPEG (use slightly higher quality for covers to preserve crisp 1px dither dots)
-        save_quality = max(options.quality, 82) if options.is_cover else options.quality
-        buffer = io.BytesIO()
-        current_img.save(
-            buffer,
-            format='JPEG',
-            quality=save_quality,
-            progressive=False,
-            optimize=True,
-            # 4:2:0 for grayscale (all 3 channels identical, saves ~15-20%)
-            # 4:4:4 for color images
-            subsampling=2 if options.grayscale else 0
+        sharpened = local_img.filter(
+            ImageFilter.UnsharpMask(radius=1.1, percent=85, threshold=3)
         )
-        output_bytes = buffer.getvalue()
+        return sharpened, mapped_px
 
-        # Build filename
-        if len(images) > 1:
-            new_filename = f"{stem}_part{i + 1}.jpg"
-            details_parts.insert(0, f"split part {i + 1}/{len(images)}")
-        else:
-            new_filename = f"{stem}.jpg"
+    @staticmethod
+    def _quantize_4level_serpentine(
+        sharpened_img: Image.Image, mapped_px: list
+    ) -> Image.Image:
+        """
+        Serpentine Edge-Aware Damped 4-Level [0, 85, 170, 255] Dithering:
+        - Alternates scan direction on even/odd rows to eliminate diagonal Floyd-Steinberg worms.
+        - Uses damped 14/16 ([6, 2, 4, 2]/16) error diffusion for crisp e-paper midtone contrast.
+        - Attenuates error propagation across sharp contrast boundaries (> 64 luminance jump)
+          by 75% so bright typography on dark backgrounds has zero gray haloing.
+        - Pins dead-zone pure blacks (0) and pure whites (255) so solid backgrounds stay clean.
+        """
+        w, h = sharpened_img.size
+        src_px = list(sharpened_img.getdata())
+        work = [float(v) for v in src_px]
 
-        results.append(ImageResult(
-            output_bytes=output_bytes,
-            new_filename=new_filename,
-            original_size=original_size if i == 0 else 0,
-            new_size=len(output_bytes),
-            was_converted=True,
-            details=", ".join(details_parts) if details_parts else "baseline JPEG"
-        ))
-
-    return results
-
-
-def generate_cover_image(title: str, author: str,
-                         width: int = X4_WIDTH, height: int = X4_HEIGHT,
-                         gray_levels: list[int] | None = None) -> bytes:
-    """
-    Generate a simple cover image from title and author text.
-    If gray_levels is given, quantize to the device palette (with dithering)
-    so gray borders/text survive low-bit-depth displays.
-    """
-    img = Image.new('RGB', (width, height), (255, 255, 255))
-    draw = ImageDraw.Draw(img)
-
-    title_size = 36
-    author_size = 24
-
-    try:
-        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", title_size)
-        author_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", author_size)
-    except (OSError, IOError):
-        try:
-            title_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", title_size)
-            author_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", author_size)
-        except (OSError, IOError):
-            title_font = ImageFont.load_default()
-            author_font = ImageFont.load_default()
-
-    border = 20
-    draw.rectangle(
-        [border, border, width - border, height - border],
-        outline=(180, 180, 180),
-        width=2
-    )
-
-    padding = 40
-    max_text_width = width - (padding * 2)
-
-    def wrap_text(text, font, max_w):
-        words = text.split()
-        lines = []
-        current_line = ""
-        for word in words:
-            test = f"{current_line} {word}".strip()
-            bbox = draw.textbbox((0, 0), test, font=font)
-            if bbox[2] - bbox[0] <= max_w:
-                current_line = test
+        for y in range(h):
+            reverse = (y % 2 == 1)
+            if reverse:
+                x_iter = range(w - 1, -1, -1)
+                x_step = -1
             else:
-                if current_line:
-                    lines.append(current_line)
-                current_line = word
-        if current_line:
-            lines.append(current_line)
-        return lines
+                x_iter = range(0, w)
+                x_step = 1
 
-    title_lines = wrap_text(title, title_font, max_text_width)
-    title_y = height // 3
-    for line in title_lines:
-        bbox = draw.textbbox((0, 0), line, font=title_font)
-        line_w = bbox[2] - bbox[0]
-        x = (width - line_w) // 2
-        draw.text((x, title_y), line, fill=(30, 30, 30), font=title_font)
-        title_y += bbox[3] - bbox[1] + 8
+            row_offset = y * w
+            has_next_y = (y + 1) < h
+            next_row_offset = (y + 1) * w
 
-    if author:
-        author_lines = wrap_text(author, author_font, max_text_width)
-        author_y = title_y + 40
-        for line in author_lines:
-            bbox = draw.textbbox((0, 0), line, font=author_font)
-            line_w = bbox[2] - bbox[0]
-            x = (width - line_w) // 2
-            draw.text((x, author_y), line, fill=(100, 100, 100), font=author_font)
-            author_y += bbox[3] - bbox[1] + 6
+            for x in x_iter:
+                idx = row_offset + x
+                orig_mapped = mapped_px[idx]
+                if orig_mapped == 0:
+                    work[idx] = 0.0
+                    continue
+                if orig_mapped == 255:
+                    work[idx] = 255.0
+                    continue
 
-    if gray_levels:
-        img = _quantize_to_levels(img.convert('L'), gray_levels).convert('RGB')
+                old_val = min(255.0, max(0.0, work[idx]))
+                if old_val < 43.0:
+                    new_val = 0.0
+                elif old_val < 128.0:
+                    new_val = 85.0
+                elif old_val < 213.0:
+                    new_val = 170.0
+                else:
+                    new_val = 255.0
+                work[idx] = new_val
 
-    buffer = io.BytesIO()
-    img.save(buffer, format='JPEG', quality=85, progressive=False, optimize=True)
-    return buffer.getvalue()
+                err = old_val - new_val
+                if err > 40.0:
+                    err = 40.0
+                elif err < -40.0:
+                    err = -40.0
+
+                src_here = src_px[idx]
+
+                # Forward neighbor: (x + x_step, y) -> 6/16 (0.375)
+                nx = x + x_step
+                if 0 <= nx < w:
+                    n_idx = row_offset + nx
+                    gate = 0.25 if abs(src_px[n_idx] - src_here) > 64 else 1.0
+                    work[n_idx] += err * 0.375 * gate
+
+                if has_next_y:
+                    # Back-diagonal: (x - x_step, y + 1) -> 2/16 (0.125)
+                    bx = x - x_step
+                    if 0 <= bx < w:
+                        b_idx = next_row_offset + bx
+                        gate = 0.25 if abs(src_px[b_idx] - src_here) > 64 else 1.0
+                        work[b_idx] += err * 0.125 * gate
+
+                    # Down: (x, y + 1) -> 4/16 (0.25)
+                    d_idx = next_row_offset + x
+                    gate = 0.25 if abs(src_px[d_idx] - src_here) > 64 else 1.0
+                    work[d_idx] += err * 0.25 * gate
+
+                    # Forward-diagonal: (x + x_step, y + 1) -> 2/16 (0.125)
+                    if 0 <= nx < w:
+                        f_idx = next_row_offset + nx
+                        gate = 0.25 if abs(src_px[f_idx] - src_here) > 64 else 1.0
+                        work[f_idx] += err * 0.125 * gate
+
+        out_img = Image.new('L', (w, h))
+        out_img.putdata([int(round(min(255.0, max(0.0, v)))) for v in work])
+        return out_img
+
+    @staticmethod
+    def optimize_image(image_bytes: bytes, options: Dict) -> Tuple[bytes, str]:
+        """
+        Optimize image for e-ink display (Xteink X4: 480x800, 4-level grayscale):
+        1. Chromatic-aware grayscale conversion (preserves warm reds/skin tones)
+        2. Smart Hybrid 480x800 full-screen fitting for covers (with edge-typography protection),
+           or proportional Lanczos resize for interior book illustrations
+        3. Adaptive shadow-lift + Local Adaptive Contrast (radius=16 dodge & burn) + fine UnsharpMask
+        4. Serpentine edge-aware damped 4-level [0, 85, 170, 255] dithering
+        5. High-precision subsampling=0 JPEG output so DCT blocks do not smear dither dots
+        Returns: (optimized_bytes, new_media_type)
+        """
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+
+            max_w = int(options.get('max_width', 480))
+            max_h = int(options.get('max_height', 800))
+            quality = int(options.get('quality', 75))
+            is_cover = bool(options.get('is_cover', False))
+
+            if options.get('grayscale', True):
+                img = ImageProcessor._to_eink_grayscale(img)
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            if is_cover and img.mode == 'L':
+                img = ImageProcessor._fit_cover_smart_hybrid(img, max_w, max_h)
+            else:
+                w, h = img.size
+                if w > max_w or h > max_h:
+                    scale = min(max_w / w, max_h / h)
+                    new_w = max(1, int(round(w * scale)))
+                    new_h = max(1, int(round(h * scale)))
+                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            if options.get('grayscale', True):
+                if img.mode != 'L':
+                    img = ImageProcessor._to_eink_grayscale(img)
+                sharpened_img, mapped_px = ImageProcessor._enhance_for_eink(img, options)
+                if options.get('quantize_4level', True):
+                    img = ImageProcessor._quantize_4level_serpentine(sharpened_img, mapped_px)
+                else:
+                    img = sharpened_img
+
+            effective_quality = max(quality, 92) if is_cover else max(quality, 85)
+
+            output = io.BytesIO()
+            img.save(
+                output,
+                format='JPEG',
+                quality=effective_quality,
+                subsampling=0,
+                optimize=True,
+            )
+            return output.getvalue(), 'image/jpeg'
+
+        except Exception as e:
+            print(f"Image optimization failed, keeping original: {str(e)}")
+            return image_bytes, None
