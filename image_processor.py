@@ -1,7 +1,8 @@
 """
 Image processor for Xteink EPUB Optimizer.
-Handles: baseline JPEG conversion, resize, grayscale quantization,
-contrast boost, Light Novel mode.
+Handles: baseline JPEG conversion, resize, chromatic-aware grayscale,
+adaptive e-ink tone mapping (shadow lift, dead-zone anti-speckle clamping,
+unsharp masking), 4-level Floyd-Steinberg quantization, and Light Novel mode.
 
 Device profiles (display orientation, portrait):
   X4 (SSD1677 controller):
@@ -19,7 +20,7 @@ import io
 from pathlib import Path
 from dataclasses import dataclass, field
 
-from PIL import Image, ImageEnhance, ImageOps, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageDraw, ImageFont
 
 
 # Device screen profiles in display orientation (portrait), matching the
@@ -72,6 +73,7 @@ class ImageOptions:
     gray_levels: list = field(default_factory=lambda: list(EINK_PALETTE_LEVELS))
     light_novel_mode: bool = False
     light_novel_rotate_left: bool = True
+    is_cover: bool = False
 
     @classmethod
     def for_device(cls, device: str, **overrides) -> 'ImageOptions':
@@ -110,6 +112,157 @@ def is_progressive_jpeg(image_bytes: bytes) -> bool:
         return img.info.get('progressive', False) or img.info.get('progression', False)
     except Exception:
         return False
+
+
+def _to_eink_grayscale(img: Image.Image) -> Image.Image:
+    """
+    Convert an image to grayscale while preserving chromatic contrast.
+    Standard ITU-R 601-2 luma (0.299R + 0.587G + 0.114B) maps saturated reds
+    and deep blues to very dark values, causing colored titles or details on
+    dark book covers to collapse into black. Blending 80% standard luma with
+    20% HSV Value (max(R, G, B)) keeps neutral grays identical while giving
+    saturated colors natural separation on 4-level e-ink.
+    """
+    if img.mode == 'L':
+        return img
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    std_l = img.convert('L')
+    r, g, b = img.split()
+    max_rgb = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    return Image.blend(std_l, max_rgb, 0.20)
+
+
+def _enhance_for_eink(gray_img: Image.Image, options: ImageOptions) -> Image.Image:
+    """
+    Adaptive histogram-driven tone mapping and micro-contrast sharpening
+    designed specifically for 4-level (SSD1677) e-ink quantization.
+
+    Replaces the naive linear Contrast(1.5) stretch (which hard-clipped the
+    bottom 33% of shadows to 0 and top 33% of highlights to 255) with:
+      1. Percentile histogram normalization (0.5% cutoff)
+      2. Automatic classification between bimodal line-art/diagrams and
+         continuous-tone artwork/covers/photos
+      3. Dead-zone black/white clamping (eliminating stray dither speckles on
+         solid black or cream/white backgrounds)
+      4. Smooth continuous shadow-lift curve so dark chiaroscuro details map
+         into the 85 and 170 gray levels instead of crushing to 0
+      5. Post-resize UnsharpMask so small cover typography and map labels stay
+         razor-sharp through Floyd-Steinberg dithering
+    """
+    hist = gray_img.histogram()
+    total = sum(hist)
+    if total <= 0:
+        return gray_img
+
+    # 1. Find 0.5% and 99.5% percentiles for gentle dynamic range normalization
+    cutoff = int(total * 0.005)
+    lo = 0
+    hi = 255
+    acc = 0
+    for i in range(256):
+        acc += hist[i]
+        if acc > cutoff:
+            lo = i
+            break
+    acc = 0
+    for i in range(255, -1, -1):
+        acc += hist[i]
+        if acc > cutoff:
+            hi = i
+            break
+    if hi <= lo:
+        lo, hi = 0, 255
+
+    # 2. Compute post-stretch luminance distribution statistics
+    span = float(hi - lo)
+    weighted_sum = 0.0
+    dark_count = 0
+    bright_count = 0
+    mid_count = 0
+
+    for i, count in enumerate(hist):
+        if count == 0:
+            continue
+        stretched = max(0.0, min(255.0, (i - lo) * 255.0 / span))
+        weighted_sum += stretched * count
+        if stretched < 64.0:
+            dark_count += count
+        elif stretched > 200.0:
+            bright_count += count
+        else:
+            mid_count += count
+
+    mean_lum = weighted_sum / total
+    bright_ratio = bright_count / total
+    mid_ratio = mid_count / total
+
+    # Scale relative to user-configured contrast_factor (default 1.5)
+    factor_scale = max(0.5, min(2.0, options.contrast_factor / 1.5))
+
+    # 3. Build 256-entry lookup table
+    lut = [0] * 256
+    is_line_art = (not options.is_cover) and (bright_ratio > 0.58) and (mid_ratio < 0.20)
+
+    if is_line_art:
+        # Bimodal diagram / map / line-art on light page background:
+        # Clamp paper background cleanly to white (255) and darken ink strokes
+        line_contrast = 1.35 * factor_scale
+        for i in range(256):
+            v = max(0.0, min(255.0, (i - lo) * 255.0 / span))
+            if v >= 218.0:
+                lut[i] = 255
+            elif v <= 15.0:
+                lut[i] = 0
+            else:
+                u = v / 218.0
+                # Darken mid-gray anti-aliased strokes so thin lines survive dithering
+                u_darkened = u ** 1.35
+                u_out = (u_darkened - 0.5) * line_contrast + 0.5
+                lut[i] = int(round(max(0.0, min(1.0, u_out)) * 255.0))
+    else:
+        # Continuous-tone cover / painting / photograph:
+        # Stronger shadow lift for dark/chiaroscuro images (mean_lum < 135),
+        # gentler lift for bright covers
+        darkness = max(0.0, min(1.0, (135.0 - mean_lum) / 85.0))
+        shadow_lift = (0.30 + 0.50 * darkness) * factor_scale
+        mid_contrast = 1.0 + 0.10 * factor_scale
+
+        for i in range(256):
+            v = max(0.0, min(255.0, (i - lo) * 255.0 / span))
+
+            # Dead-zone clamping for speckle-free pure black and pure white backgrounds
+            if v <= 6.0:
+                lut[i] = 0
+                continue
+            if v >= 249.0:
+                lut[i] = 255
+                continue
+
+            u = (v - 6.0) / (249.0 - 6.0)
+
+            # Smooth continuous shadow lift: peaks in deep shadows (~0.25) and
+            # vanishes smoothly at 0.0 and 1.0 with zero boundary seams
+            u_lifted = u + shadow_lift * u * ((1.0 - u) ** 1.4)
+
+            # Gentle midtone expansion to separate the 85 and 170 gray levels
+            u_contrast = (u_lifted - 0.5) * mid_contrast + 0.5
+
+            # Crisp highlight & light-typography roll-up above 0.78
+            if u_contrast > 0.78:
+                t = (u_contrast - 0.78) / 0.22
+                u_contrast = u_contrast + (1.0 - u_contrast) * t * 0.55
+
+            u_contrast = max(0.0, min(1.0, u_contrast))
+            lut[i] = int(round(u_contrast * 255.0))
+
+    mapped = gray_img.point(lut)
+
+    # 4. Resolution-native UnsharpMask (applied at target 480x800 resolution)
+    # Keeps small cover quotes, serif typography, and fine linework crisp
+    mapped = mapped.filter(ImageFilter.UnsharpMask(radius=1.2, percent=95, threshold=3))
+    return mapped
 
 
 def _quantize_to_levels(img: Image.Image, levels: list[int]) -> Image.Image:
@@ -254,15 +407,15 @@ def process_image(image_bytes: bytes, filename: str, options: ImageOptions = Non
 
         # Convert to grayscale
         if options.grayscale:
-            current_img = current_img.convert('L')
+            current_img = _to_eink_grayscale(current_img)
 
-            # Contrast enhancement (before quantization for best results)
+            # Contrast & tone-mapping enhancement (before quantization)
             if options.contrast_boost:
                 if options.eink_quantize:
-                    # Auto-stretch histogram first for better level mapping
-                    current_img = ImageOps.autocontrast(current_img, cutoff=1)
-                enhancer = ImageEnhance.Contrast(current_img)
-                current_img = enhancer.enhance(options.contrast_factor)
+                    current_img = _enhance_for_eink(current_img, options)
+                else:
+                    enhancer = ImageEnhance.Contrast(current_img)
+                    current_img = enhancer.enhance(options.contrast_factor)
 
             # Quantize to device e-ink levels with dithering
             if options.eink_quantize:
@@ -275,9 +428,9 @@ def process_image(image_bytes: bytes, filename: str, options: ImageOptions = Non
                 details_parts.append("grayscale")
 
             if options.contrast_boost:
-                details_parts.append(f"contrast {options.contrast_factor}x")
+                details_parts.append("e-ink adaptive tone-mapped" if options.eink_quantize else f"contrast {options.contrast_factor}x")
 
-            # Convert back to RGB for JPEG compatibility
+            # Convert back to RGB for hardware decoder compatibility
             current_img = current_img.convert('RGB')
 
         elif options.contrast_boost:
@@ -286,12 +439,13 @@ def process_image(image_bytes: bytes, filename: str, options: ImageOptions = Non
             current_img = enhancer.enhance(options.contrast_factor)
             details_parts.append(f"contrast {options.contrast_factor}x")
 
-        # Save as baseline JPEG
+        # Save as baseline JPEG (use slightly higher quality for covers to preserve crisp 1px dither dots)
+        save_quality = max(options.quality, 82) if options.is_cover else options.quality
         buffer = io.BytesIO()
         current_img.save(
             buffer,
             format='JPEG',
-            quality=options.quality,
+            quality=save_quality,
             progressive=False,
             optimize=True,
             # 4:2:0 for grayscale (all 3 channels identical, saves ~15-20%)

@@ -187,15 +187,11 @@ def process_epub(input_path: str, output_path: str,
 
         # Step 7: Process images (20-60%)
         _progress(15, "Processing images...")
-        image_options = ImageOptions.for_device(
-            options.device,
-            grayscale=options.grayscale,
-            contrast_boost=options.contrast_boost,
-            contrast_factor=options.contrast_factor,
-            quality=options.quality,
-            eink_quantize=options.eink_quantize,
-            light_novel_mode=options.light_novel_mode,
-            light_novel_rotate_left=options.light_novel_rotate_left,
+        opf_dir_norm = os.path.normpath(str(Path(opf_path).parent))
+        cover_abs_norm = (
+            os.path.normpath(os.path.join(opf_dir_norm, metadata['cover_href']))
+            if metadata.get('cover_href')
+            else None
         )
 
         image_files = content_files['images']
@@ -214,6 +210,24 @@ def process_epub(input_path: str, output_path: str,
 
             if not should_process(img_path):
                 continue
+
+            img_norm = os.path.normpath(img_path)
+            is_cover_img = (
+                (cover_abs_norm is not None and img_norm == cover_abs_norm)
+                or ('cover' in Path(img_path).stem.lower())
+            )
+
+            image_options = ImageOptions.for_device(
+                options.device,
+                grayscale=options.grayscale,
+                contrast_boost=options.contrast_boost,
+                contrast_factor=options.contrast_factor,
+                quality=options.quality,
+                eink_quantize=options.eink_quantize,
+                light_novel_mode=options.light_novel_mode,
+                light_novel_rotate_left=options.light_novel_rotate_left,
+                is_cover=is_cover_img,
+            )
 
             results = process_image(img_bytes, Path(img_path).name, image_options)
 
