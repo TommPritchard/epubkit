@@ -172,19 +172,20 @@ def _to_eink_grayscale(img: Image.Image) -> Image.Image:
     return gray
 
 
-def _analyze_border_uniformity(img: Image.Image, is_top: bool) -> Tuple[bool, Tuple[int, int, int]]:
+def _analyze_border_stats(img: Image.Image, is_top: bool, depth_px: int) -> Tuple[float, Tuple[int, int, int]]:
     """
-    Measure if a border is a uniform / solid color (e.g. Kazuo Ishiguro's Faber covers, Penguin classics, etc.)
-    Returns (is_uniform, (r, g, b)).
+    Measure border luminance std_lum and average RGB color over a given depth in pixels.
     """
     w, h = img.size
-    sample_y = range(0, min(h, 4)) if is_top else range(max(0, h - 4), h)
+    depth = max(1, min(depth_px, h))
+    sample_y = range(0, depth) if is_top else range(max(0, h - depth), h)
     rgb_img = img.convert('RGB')
     px = rgb_img.load()
     r_sum, g_sum, b_sum, sq_sum, cnt = 0, 0, 0, 0, 0
-    step = max(1, w // 100)
-    for y in sample_y:
-        for x in range(0, w, step):
+    step_x = max(1, w // 100)
+    step_y = max(1, depth // 6)
+    for y in range(sample_y.start, sample_y.stop, step_y):
+        for x in range(0, w, step_x):
             r, g, b = px[x, y]
             lum = 0.299 * r + 0.587 * g + 0.114 * b
             r_sum += r
@@ -193,26 +194,20 @@ def _analyze_border_uniformity(img: Image.Image, is_top: bool) -> Tuple[bool, Tu
             sq_sum += lum * lum
             cnt += 1
     if cnt == 0:
-        return True, (128, 128, 128)
+        return 0.0, (128, 128, 128)
     mean_lum = (0.299 * r_sum + 0.587 * g_sum + 0.114 * b_sum) / cnt
     var_lum = (sq_sum / cnt) - (mean_lum * mean_lum)
     std_lum = math.sqrt(max(0.0, var_lum))
-    is_uniform = std_lum < 28.0
-    avg_color = (int(r_sum / cnt), int(g_sum / cnt), int(b_sum / cnt))
-    return is_uniform, avg_color
+    avg_color = (int(round(r_sum / cnt)), int(round(g_sum / cnt)), int(round(b_sum / cnt)))
+    return std_lum, avg_color
 
 
 def _fit_cover_smart_hybrid(img: Image.Image, target_w: int = 480, target_h: int = 800) -> Image.Image:
     """
-    Smart Hybrid full-screen cover fitting (480x800 for X4, 528x792 for X3):
-    1. Zero Distortion: Aspect ratio is strictly preserved (0% vertical or horizontal stretch).
-       Squares remain squares, circles remain circles, faces and figures are never distorted.
-    2. Zero Cropping: The complete cover artwork, title, and author remain 100% visible.
-    3. Seamless Padding:
-       - If top/bottom border is uniform/plain (any color: yellow, cream, pastel, orange, black, etc.),
-         the border color extends to fill the top/bottom pad with zero visible seam.
-       - If photographic or painted artwork reaches the edges, an ambient Gaussian-blurred backdrop
-         fills the pad naturally behind the crisp, centered cover.
+    Strict 3-Tier Cover Fitting (0% Blur Fallback):
+      Tier 1 (Both edges blank): 50/50 exact plain border extension (0% stretch, 0% crop, e.g. Ishiguro)
+      Tier 2 (One edge blank): Asymmetric 100% extension on blank edge, complex edge sits flush (e.g. In Memoriam, The Human Factor)
+      Tier 3 (Both edges complex): 70/30 Hybrid (~2.5%-3.5% crop per side, only ~2.0%-3.0% micro-stretch, no blur, no bars)
     """
     sw, sh = img.size
     if sw <= 0 or sh <= 0:
@@ -229,60 +224,79 @@ def _fit_cover_smart_hybrid(img: Image.Image, target_w: int = 480, target_h: int
     img_rgb = img.convert('RGB')
 
     if src_ratio > target_ratio:
-        # Cover is wider than screen aspect (e.g. 2:3 = 0.667 vs 3:5 = 0.600):
-        # Scale width to target_w, natural height is smaller than target_h
+        # Cover is wider than screen aspect (e.g. 2:3 = 0.667 vs 3:5 = 0.600)
         natural_h = int(round(target_w / src_ratio))
         deficit_h = target_h - natural_h
-        pad_top = deficit_h // 2
-        pad_bot = deficit_h - pad_top
 
-        top_uniform, top_col = _analyze_border_uniformity(img_rgb, is_top=True)
-        bot_uniform, bot_col = _analyze_border_uniformity(img_rgb, is_top=False)
+        # Strict blank border check: both 4px edge AND 3% band to avoid catching gradients/flames
+        band_px = max(8, int(round(sh * 0.03)))
+        top4_std, top_col = _analyze_border_stats(img_rgb, is_top=True, depth_px=4)
+        bot4_std, bot_col = _analyze_border_stats(img_rgb, is_top=False, depth_px=4)
+        top_band_std, _ = _analyze_border_stats(img_rgb, is_top=True, depth_px=band_px)
+        bot_band_std, _ = _analyze_border_stats(img_rgb, is_top=False, depth_px=band_px)
 
-        scaled_cover = img_rgb.resize((target_w, natural_h), Image.Resampling.LANCZOS)
+        top_blank = (top4_std < 5.5) and (top_band_std < 6.5)
+        bot_blank = (bot4_std < 5.5) and (bot_band_std < 6.5)
 
-        if top_uniform and bot_uniform:
+        if top_blank and bot_blank:
+            # Tier 1: Both edges blank -> 50/50 solid extension
+            pad_top = deficit_h // 2
+            pad_bot = deficit_h - pad_top
+            scaled_cover = img_rgb.resize((target_w, natural_h), Image.Resampling.LANCZOS)
             canvas = Image.new('RGB', (target_w, target_h), top_col)
             if pad_bot > 0:
                 bot_slice = Image.new('RGB', (target_w, pad_bot + 2), bot_col)
                 canvas.paste(bot_slice, (0, pad_top + natural_h - 2))
             canvas.paste(scaled_cover, (0, pad_top))
             return canvas
+        elif top_blank and not bot_blank:
+            # Tier 2a: Top is blank, bottom is complex -> 100% extension at top, bottom sits flush
+            pad_top = deficit_h
+            scaled_cover = img_rgb.resize((target_w, natural_h), Image.Resampling.LANCZOS)
+            canvas = Image.new('RGB', (target_w, target_h), top_col)
+            canvas.paste(scaled_cover, (0, pad_top))
+            return canvas
+        elif bot_blank and not top_blank:
+            # Tier 2b: Bottom is blank, top is complex -> 100% extension at bottom, top sits flush
+            pad_bot = deficit_h
+            scaled_cover = img_rgb.resize((target_w, natural_h), Image.Resampling.LANCZOS)
+            canvas = Image.new('RGB', (target_w, target_h), bot_col)
+            canvas.paste(scaled_cover, (0, 0))
+            return canvas
         else:
-            # Ambient mirror/blurred backdrop for complex photographic/painting art
-            bg_scale = max(float(target_w) / sw, float(target_h) / sh)
-            bg_w = int(round(sw * bg_scale))
-            bg_h = int(round(sh * bg_scale))
-            bg = img_rgb.resize((bg_w, bg_h), Image.Resampling.LANCZOS)
-            crop_x = (bg_w - target_w) // 2
-            crop_y = (bg_h - target_h) // 2
-            bg = bg.crop((crop_x, crop_y, crop_x + target_w, crop_y + target_h))
-            bg = bg.filter(ImageFilter.GaussianBlur(radius=28))
-
-            if top_uniform:
-                top_slice = Image.new('RGB', (target_w, pad_top + 1), top_col)
-                bg.paste(top_slice, (0, 0))
-            if bot_uniform:
-                bot_slice = Image.new('RGB', (target_w, pad_bot + 1), bot_col)
-                bg.paste(bot_slice, (0, pad_top + natural_h - 1))
-
-            bg.paste(scaled_cover, (0, pad_top))
-            return bg
+            # Tier 3: Both edges complex -> 70/30 Hybrid (~2.5%-3.5% crop/side, ~2.0%-3.0% micro-stretch)
+            scale_cover = float(target_h) / float(sh)
+            crop_only_w = float(sw) * scale_cover
+            draw_w = int(round((0.30 * target_w) + (0.70 * crop_only_w)))
+            scaled_cover = img_rgb.resize((draw_w, target_h), Image.Resampling.LANCZOS)
+            crop_x = (draw_w - target_w) // 2
+            return scaled_cover.crop((crop_x, 0, crop_x + target_w, target_h))
     else:
         # Cover is taller than screen: scale height to target_h, pad left/right
         natural_w = int(round(target_h * src_ratio))
         deficit_w = target_w - natural_w
-        pad_left = deficit_w // 2
 
-        scaled_cover = img_rgb.resize((natural_w, target_h), Image.Resampling.LANCZOS)
-        bg_scale = max(float(target_w) / sw, float(target_h) / sh)
-        bg_w = int(round(sw * bg_scale))
-        bg_h = int(round(sh * bg_scale))
-        bg = img_rgb.resize((bg_w, bg_h), Image.Resampling.LANCZOS)
-        crop_x = (bg_w - target_w) // 2
-        crop_y = (bg_h - target_h) // 2
-        bg = bg.crop((crop_x, crop_y, crop_x + target_w, crop_y + target_h))
-        bg = bg.filter(ImageFilter.GaussianBlur(radius=28))
+        left_std, left_col = _analyze_border_stats(img_rgb, is_top=True, depth_px=4)
+        right_std, right_col = _analyze_border_stats(img_rgb, is_top=False, depth_px=4)
+
+        if left_std < 5.5 and right_std < 5.5:
+            pad_left = deficit_w // 2
+            pad_right = deficit_w - pad_left
+            scaled_cover = img_rgb.resize((natural_w, target_h), Image.Resampling.LANCZOS)
+            canvas = Image.new('RGB', (target_w, target_h), left_col)
+            if pad_right > 0:
+                right_slice = Image.new('RGB', (pad_right + 2, target_h), right_col)
+                canvas.paste(right_slice, (pad_left + natural_w - 2, 0))
+            canvas.paste(scaled_cover, (pad_left, 0))
+            return canvas
+        else:
+            # 70/30 Hybrid for tall covers
+            scale_cover = float(target_w) / float(sw)
+            crop_only_h = float(sh) * scale_cover
+            draw_h = int(round((0.30 * target_h) + (0.70 * crop_only_h)))
+            scaled_cover = img_rgb.resize((target_w, draw_h), Image.Resampling.LANCZOS)
+            crop_y = (draw_h - target_h) // 2
+            return scaled_cover.crop((0, crop_y, target_w, crop_y + target_h))
         bg.paste(scaled_cover, (pad_left, 0))
         return bg
 
