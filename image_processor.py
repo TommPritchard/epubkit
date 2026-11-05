@@ -205,9 +205,9 @@ def _analyze_border_stats(img: Image.Image, is_top: bool, depth_px: int) -> Tupl
 def _fit_cover_smart_hybrid(img: Image.Image, target_w: int = 480, target_h: int = 800) -> Image.Image:
     """
     Strict 3-Tier Cover Fitting (0% Blur Fallback):
-      Tier 1 (Both edges blank): 50/50 exact plain border extension (0% stretch, 0% crop, e.g. Ishiguro)
-      Tier 2 (One edge blank): Asymmetric 100% extension on blank edge, complex edge sits flush (e.g. In Memoriam, The Human Factor)
-      Tier 3 (Both edges complex): 70/30 Hybrid (~2.5%-3.5% crop per side, only ~2.0%-3.0% micro-stretch, no blur, no bars)
+      Tier 1 (Both edges blank): 50/50 exact plain border extension (0% stretch, 0% crop)
+      Tier 2 (One edge blank): Hybrid 50% extension on blank edge + 70/30 crop/stretch zoom for remaining 50% deficit
+      Tier 3 (Both edges complex): 70/30 Hybrid (~2.5%-3.5% crop per side, ~2.0%-3.0% micro-stretch, no blur, no bars)
     """
     sw, sh = img.size
     if sw <= 0 or sh <= 0:
@@ -228,15 +228,20 @@ def _fit_cover_smart_hybrid(img: Image.Image, target_w: int = 480, target_h: int
         natural_h = int(round(target_w / src_ratio))
         deficit_h = target_h - natural_h
 
-        # Strict blank border check: both 4px edge AND 3% band to avoid catching gradients/flames
-        band_px = max(8, int(round(sh * 0.03)))
-        top4_std, top_col = _analyze_border_stats(img_rgb, is_top=True, depth_px=4)
-        bot4_std, bot_col = _analyze_border_stats(img_rgb, is_top=False, depth_px=4)
-        top_band_std, _ = _analyze_border_stats(img_rgb, is_top=True, depth_px=band_px)
-        bot_band_std, _ = _analyze_border_stats(img_rgb, is_top=False, depth_px=band_px)
+        # Sample outermost 3px edge + color distance for solid/paper-grain borders
+        top3_std, top_col = _analyze_border_stats(img_rgb, is_top=True, depth_px=3)
+        bot3_std, bot_col = _analyze_border_stats(img_rgb, is_top=False, depth_px=3)
+        color_dist = math.sqrt(
+            (top_col[0] - bot_col[0]) ** 2 +
+            (top_col[1] - bot_col[1]) ** 2 +
+            (top_col[2] - bot_col[2]) ** 2
+        )
 
-        top_blank = (top4_std < 5.5) and (top_band_std < 6.5)
-        bot_blank = (bot4_std < 5.5) and (bot_band_std < 6.5)
+        top_blank = top3_std < 5.5
+        bot_blank = bot3_std < 5.5
+        if color_dist < 18.0 and top3_std < 9.0 and bot3_std < 9.0:
+            top_blank = True
+            bot_blank = True
 
         if top_blank and bot_blank:
             # Tier 1: Both edges blank -> 50/50 solid extension
@@ -249,19 +254,21 @@ def _fit_cover_smart_hybrid(img: Image.Image, target_w: int = 480, target_h: int
                 canvas.paste(bot_slice, (0, pad_top + natural_h - 2))
             canvas.paste(scaled_cover, (0, pad_top))
             return canvas
-        elif top_blank and not bot_blank:
-            # Tier 2a: Top is blank, bottom is complex -> 100% extension at top, bottom sits flush
-            pad_top = deficit_h
-            scaled_cover = img_rgb.resize((target_w, natural_h), Image.Resampling.LANCZOS)
-            canvas = Image.new('RGB', (target_w, target_h), top_col)
-            canvas.paste(scaled_cover, (0, pad_top))
-            return canvas
-        elif bot_blank and not top_blank:
-            # Tier 2b: Bottom is blank, top is complex -> 100% extension at bottom, top sits flush
-            pad_bot = deficit_h
-            scaled_cover = img_rgb.resize((target_w, natural_h), Image.Resampling.LANCZOS)
-            canvas = Image.new('RGB', (target_w, target_h), bot_col)
-            canvas.paste(scaled_cover, (0, 0))
+        elif top_blank or bot_blank:
+            # Tier 2: Hybrid 50% extension on blank edge + 70/30 crop/stretch zoom for remaining 50% deficit
+            pad = int(round(0.50 * deficit_h))
+            draw_h = target_h - pad
+            prop_w = float(draw_h) * src_ratio
+            draw_w = int(round((0.30 * target_w) + (0.70 * prop_w)))
+            scaled_cover = img_rgb.resize((draw_w, draw_h), Image.Resampling.LANCZOS)
+            crop_x = (draw_w - target_w) // 2
+            cropped_cover = scaled_cover.crop((crop_x, 0, crop_x + target_w, draw_h))
+            if top_blank:
+                canvas = Image.new('RGB', (target_w, target_h), top_col)
+                canvas.paste(cropped_cover, (0, pad))
+            else:
+                canvas = Image.new('RGB', (target_w, target_h), bot_col)
+                canvas.paste(cropped_cover, (0, 0))
             return canvas
         else:
             # Tier 3: Both edges complex -> 70/30 Hybrid (~2.5%-3.5% crop/side, ~2.0%-3.0% micro-stretch)
@@ -276,8 +283,8 @@ def _fit_cover_smart_hybrid(img: Image.Image, target_w: int = 480, target_h: int
         natural_w = int(round(target_h * src_ratio))
         deficit_w = target_w - natural_w
 
-        left_std, left_col = _analyze_border_stats(img_rgb, is_top=True, depth_px=4)
-        right_std, right_col = _analyze_border_stats(img_rgb, is_top=False, depth_px=4)
+        left_std, left_col = _analyze_border_stats(img_rgb, is_top=True, depth_px=3)
+        right_std, right_col = _analyze_border_stats(img_rgb, is_top=False, depth_px=3)
 
         if left_std < 5.5 and right_std < 5.5:
             pad_left = deficit_w // 2
@@ -297,8 +304,6 @@ def _fit_cover_smart_hybrid(img: Image.Image, target_w: int = 480, target_h: int
             scaled_cover = img_rgb.resize((target_w, draw_h), Image.Resampling.LANCZOS)
             crop_y = (draw_h - target_h) // 2
             return scaled_cover.crop((0, crop_y, target_w, crop_y + target_h))
-        bg.paste(scaled_cover, (pad_left, 0))
-        return bg
 
 
 def _enhance_for_eink(gray_img: Image.Image, options: ImageOptions) -> Tuple[Image.Image, list]:
