@@ -109,21 +109,171 @@ def test_pipeline_keeps_text_intact():
     assert 'Ã' not in chapter
 
 
-def test_upload_endpoint_accepts_multipart():
+def test_upload_endpoint_accepts_multipart(monkeypatch, tmp_path):
     pytest.importorskip('httpx', reason='TestClient needs httpx')
     from fastapi.testclient import TestClient
     import app as app_module
 
-    work = tempfile.mkdtemp()
-    src = os.path.join(work, 'in.epub')
+    monkeypatch.setattr(app_module, 'CONVERTER_API_KEY', 'test-secret')
+    monkeypatch.setattr(app_module, 'UPLOAD_DIR', tmp_path / 'uploads')
+    monkeypatch.setattr(app_module, 'OUTPUT_DIR', tmp_path / 'outputs')
+    app_module.tasks.clear()
+
+    src = str(tmp_path / 'in.epub')
     build_epub(src)
 
-    client = TestClient(app_module.app)
-    with open(src, 'rb') as fh:
-        response = client.post(
-            '/upload',
-            files={'files': ('Der Verkäufer.epub', fh, 'application/epub+zip')})
+    with TestClient(app_module.app) as client:
+        with open(src, 'rb') as fh:
+            response = client.post(
+                '/upload',
+                headers={'X-API-Key': 'test-secret'},
+                files={'files': ('Der Verkäufer.epub', fh, 'application/epub+zip')},
+            )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload['files'][0]['metadata']['title'] == 'Der Verkäufer'
+
+
+def test_auth_fail_closed_when_key_unset(monkeypatch):
+    pytest.importorskip('httpx', reason='TestClient needs httpx')
+    from fastapi.testclient import TestClient
+    import app as app_module
+
+    monkeypatch.setattr(app_module, 'CONVERTER_API_KEY', '')
+
+    with TestClient(app_module.app) as client:
+        assert client.get('/health').status_code == 200
+        assert client.get('/').status_code == 404
+        assert client.post('/upload').status_code == 404
+
+
+def test_auth_rejects_invalid_and_accepts_valid_key(monkeypatch):
+    pytest.importorskip('httpx', reason='TestClient needs httpx')
+    from fastapi.testclient import TestClient
+    import app as app_module
+
+    monkeypatch.setattr(app_module, 'CONVERTER_API_KEY', 'super-secret')
+
+    with TestClient(app_module.app) as client:
+        assert client.get('/').status_code == 404
+        assert client.get('/', headers={'X-API-Key': 'wrong'}).status_code == 404
+        assert client.get('/', headers={'X-API-Key': 'super-secret'}).status_code == 200
+        # Temporary MP-04 compatibility: ?api_key= query param
+        assert client.get('/?api_key=super-secret').status_code == 200
+
+
+def test_upload_sanitizes_path_traversal_filename(monkeypatch, tmp_path):
+    pytest.importorskip('httpx', reason='TestClient needs httpx')
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    import app as app_module
+
+    upload_dir = tmp_path / 'uploads'
+    monkeypatch.setattr(app_module, 'CONVERTER_API_KEY', 'test-secret')
+    monkeypatch.setattr(app_module, 'UPLOAD_DIR', upload_dir)
+    monkeypatch.setattr(app_module, 'OUTPUT_DIR', tmp_path / 'outputs')
+    app_module.tasks.clear()
+
+    src = str(tmp_path / 'in.epub')
+    build_epub(src)
+
+    with TestClient(app_module.app) as client:
+        with open(src, 'rb') as fh:
+            response = client.post(
+                '/upload',
+                headers={'X-API-Key': 'test-secret'},
+                files={'files': ('../../evil\\..\\secret.epub', fh, 'application/epub+zip')},
+            )
+
+    assert response.status_code == 200
+    file_info = response.json()['files'][0]
+    assert file_info['filename'] == 'secret.epub'
+    task_id = file_info['task_id']
+    assert task_id is not None
+    saved_path = Path(app_module.tasks[task_id]['file_path'])
+    assert saved_path.parent == upload_dir / task_id
+    assert saved_path.name == 'secret.epub'
+
+
+def test_upload_enforces_max_file_size_streaming(monkeypatch, tmp_path):
+    pytest.importorskip('httpx', reason='TestClient needs httpx')
+    from fastapi.testclient import TestClient
+    import app as app_module
+
+    upload_dir = tmp_path / 'uploads'
+    monkeypatch.setattr(app_module, 'CONVERTER_API_KEY', 'test-secret')
+    monkeypatch.setattr(app_module, 'UPLOAD_DIR', upload_dir)
+    monkeypatch.setattr(app_module, 'OUTPUT_DIR', tmp_path / 'outputs')
+    monkeypatch.setattr(app_module, 'MAX_FILE_SIZE', 1024)
+    monkeypatch.setattr(app_module, 'UPLOAD_CHUNK_SIZE', 256)
+    app_module.tasks.clear()
+
+    src = str(tmp_path / 'big.epub')
+    build_epub(src)
+
+    with TestClient(app_module.app) as client:
+        with open(src, 'rb') as fh:
+            response = client.post(
+                '/upload',
+                headers={'X-API-Key': 'test-secret'},
+                files={'files': ('big.epub', fh, 'application/epub+zip')},
+            )
+
+    assert response.status_code == 200
+    file_info = response.json()['files'][0]
+    assert file_info['task_id'] is None
+    assert 'File too large' in file_info['error']
+    assert not any(upload_dir.iterdir())
+
+
+def test_evict_expired_tasks_and_worker_cap(monkeypatch):
+    import app as app_module
+
+    app_module.tasks.clear()
+    app_module.tasks['old-task'] = {'status': 'done', 'created_at': 100.0}
+    app_module.tasks['fresh-task'] = {'status': 'done', 'created_at': 5000.0}
+
+    removed = app_module.evict_expired_tasks(cutoff=1000.0)
+    assert removed == 1
+    assert 'old-task' not in app_module.tasks
+    assert 'fresh-task' in app_module.tasks
+    assert app_module.executor._max_workers == 2
+
+
+def test_cors_restricts_unknown_origin():
+    pytest.importorskip('httpx', reason='TestClient needs httpx')
+    from fastapi.testclient import TestClient
+    import app as app_module
+
+    with TestClient(app_module.app) as client:
+        evil = client.options(
+            '/upload',
+            headers={'Origin': 'https://evil.example.com', 'Access-Control-Request-Method': 'POST'},
+        )
+        assert evil.headers.get('access-control-allow-origin') is None
+
+        vercel = client.options(
+            '/upload',
+            headers={'Origin': 'https://reading-ledger.vercel.app', 'Access-Control-Request-Method': 'POST'},
+        )
+        assert vercel.headers.get('access-control-allow-origin') == 'https://reading-ledger.vercel.app'
+
+        local = client.options(
+            '/upload',
+            headers={'Origin': 'http://localhost:5173', 'Access-Control-Request-Method': 'POST'},
+        )
+        assert local.headers.get('access-control-allow-origin') == 'http://localhost:5173'
+
+
+def test_xml_parser_blocks_external_entities():
+    from lxml import etree
+    from html_cleaner import xml_parser
+
+    xxe_payload = (
+        b'<?xml version="1.0" encoding="utf-8"?>'
+        b'<!DOCTYPE root [ <!ENTITY ext SYSTEM "http://127.0.0.1:9/secret"> ]>'
+        b'<root>&ext;</root>'
+    )
+    tree = etree.fromstring(xxe_payload, xml_parser())
+    assert tree.text is None or 'http://' not in tree.text

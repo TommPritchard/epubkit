@@ -24,6 +24,11 @@ FONT_MEDIA_TYPES = {
 }
 
 
+def xml_parser() -> etree.XMLParser:
+    """Build a hardened XML parser with external entities and network access disabled."""
+    return etree.XMLParser(resolve_entities=False, no_network=True)
+
+
 def recovery_parser(xhtml_bytes: bytes = b'') -> etree.HTMLParser:
     """
     Build lxml's recovery parser with an explicit encoding.
@@ -36,8 +41,8 @@ def recovery_parser(xhtml_bytes: bytes = b'') -> etree.HTMLParser:
     try:
         xhtml_bytes.decode('utf-8')
     except UnicodeDecodeError:
-        return etree.HTMLParser(recover=True)
-    return etree.HTMLParser(recover=True, encoding='utf-8')
+        return etree.HTMLParser(recover=True, no_network=True)
+    return etree.HTMLParser(recover=True, encoding='utf-8', no_network=True)
 
 
 def repair_html(html_bytes: bytes) -> bytes:
@@ -47,7 +52,7 @@ def repair_html(html_bytes: bytes) -> bytes:
     """
     # Try parsing as proper XML first
     try:
-        tree = etree.fromstring(html_bytes)
+        tree = etree.fromstring(html_bytes, xml_parser())
         # Already valid - just re-serialize cleanly
         return etree.tostring(tree, encoding='unicode', pretty_print=True).encode('utf-8')
     except etree.XMLSyntaxError:
@@ -213,7 +218,7 @@ def normalize_whitespace(xhtml_bytes: bytes) -> tuple[bytes, int]:
     Returns (cleaned bytes, count of removed elements).
     """
     try:
-        tree = etree.fromstring(xhtml_bytes)
+        tree = etree.fromstring(xhtml_bytes, xml_parser())
     except etree.XMLSyntaxError:
         parser = recovery_parser(xhtml_bytes)
         tree = etree.fromstring(xhtml_bytes, parser)
@@ -295,7 +300,7 @@ def strip_unnecessary_attributes(xhtml_bytes: bytes) -> tuple[bytes, int]:
     Returns (cleaned bytes, count of removed attributes).
     """
     try:
-        tree = etree.fromstring(xhtml_bytes)
+        tree = etree.fromstring(xhtml_bytes, xml_parser())
     except etree.XMLSyntaxError:
         parser = recovery_parser(xhtml_bytes)
         tree = etree.fromstring(xhtml_bytes, parser)
@@ -355,7 +360,7 @@ def add_chapter_page_breaks(xhtml_bytes: bytes) -> bytes:
     This ensures proper chapter separation on e-readers.
     """
     try:
-        tree = etree.fromstring(xhtml_bytes)
+        tree = etree.fromstring(xhtml_bytes, xml_parser())
     except etree.XMLSyntaxError:
         return xhtml_bytes
 

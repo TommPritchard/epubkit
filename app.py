@@ -5,11 +5,13 @@ Secured for private Reading Ledger integration.
 """
 
 import os
+import hmac
 import json
 import uuid
 import shutil
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -24,21 +26,111 @@ from epub_processor import process_epub, extract_epub_metadata, ProcessingOption
 from image_processor import DEVICE_PROFILES
 from metadata_handler import FILENAME_FORMATS, format_filename
 
-app = FastAPI(title="epubkit")
 
-# Secret API key from environment variable
+def _parse_allowed_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8000",
+    ]
+
+
+# Secret API key from environment variable (fail-closed if unset)
 CONVERTER_API_KEY = os.environ.get("CONVERTER_API_KEY", "")
-
-# 1. Enable CORS for Reading Ledger web app
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+ALLOWED_ORIGINS = _parse_allowed_origins()
+ALLOWED_ORIGIN_REGEX = os.environ.get(
+    "ALLOWED_ORIGIN_REGEX",
+    r"^https://([a-zA-Z0-9-]+\.)?vercel\.app$",
 )
 
-# 2. Security Middleware: verify API Key on all non-health requests
+
+def _is_authorized(request: Request) -> bool:
+    """Verify request API key using constant-time comparison (fail-closed)."""
+    expected = (CONVERTER_API_KEY or "").strip()
+    if not expected:
+        return False
+    # TODO(MP-04): drop query_params.get("api_key") once Reading_Ledger MP-04 ships header-only / SSE token auth
+    token = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+    if not token:
+        return False
+    return hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
+
+
+# Temp directory for uploads and outputs
+TEMP_DIR = Path("./tmp")
+UPLOAD_DIR = TEMP_DIR / "uploads"
+OUTPUT_DIR = TEMP_DIR / "outputs"
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB streaming chunks
+TASK_TTL_SECONDS = 3600
+
+# Thread pool for processing (capped at 2 for Render's 512 MB free tier)
+executor = ThreadPoolExecutor(max_workers=2)
+
+# In-memory task tracking
+tasks: dict = {}
+
+
+def evict_expired_tasks(cutoff: float) -> int:
+    """Remove expired task entries older than cutoff timestamp."""
+    expired_ids = [
+        tid for tid, info in list(tasks.items())
+        if info.get("created_at", 0) < cutoff
+    ]
+    for tid in expired_ids:
+        tasks.pop(tid, None)
+    return len(expired_ids)
+
+
+async def cleanup_old_files():
+    """Remove temp files and task entries older than 1 hour."""
+    while True:
+        await asyncio.sleep(300)  # Check every 5 minutes
+        cutoff = time.time() - TASK_TTL_SECONDS
+        evict_expired_tasks(cutoff)
+        for d in [UPLOAD_DIR, OUTPUT_DIR]:
+            if d.exists():
+                for item in d.iterdir():
+                    if item.is_dir() and item.stat().st_mtime < cutoff:
+                        shutil.rmtree(item, ignore_errors=True)
+        batch_dir = OUTPUT_DIR / "batch"
+        if batch_dir.exists():
+            for item in batch_dir.iterdir():
+                if item.is_file() and item.stat().st_mtime < cutoff:
+                    item.unlink(missing_ok=True)
+
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_task = asyncio.create_task(cleanup_old_files())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+
+
+app = FastAPI(title="epubkit", lifespan=lifespan)
+
+# 1. Enable CORS for Reading Ledger web app + localhost dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["X-API-Key", "Content-Type"],
+)
+
+
+# 2. Security Middleware: fail-closed API Key verification on all non-health requests
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
     # Always allow CORS preflight requests
@@ -49,15 +141,12 @@ async def verify_api_key(request: Request, call_next):
     if request.url.path == "/health":
         return await call_next(request)
 
-    # If an API key is configured, protect all other endpoints
-    if CONVERTER_API_KEY:
-        token = request.headers.get("X-API-Key") or request.query_params.get("api_key")
-        if token != CONVERTER_API_KEY:
-            # Return 404 to mask the service from public visitors
-            return HTMLResponse(
-                "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>",
-                status_code=404
-            )
+    if not _is_authorized(request):
+        # Return 404 to mask the service from public visitors
+        return HTMLResponse(
+            "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>",
+            status_code=404
+        )
 
     return await call_next(request)
 
@@ -72,47 +161,22 @@ async def health():
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# Temp directory for uploads and outputs
-TEMP_DIR = Path("./tmp")
-UPLOAD_DIR = TEMP_DIR / "uploads"
-OUTPUT_DIR = TEMP_DIR / "outputs"
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-
-# Thread pool for processing
-executor = ThreadPoolExecutor(max_workers=4)
-
-# In-memory task tracking
-tasks: dict = {}
-
-
-@app.on_event("startup")
-async def startup():
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Start cleanup background task
-    asyncio.create_task(cleanup_old_files())
-
-
-async def cleanup_old_files():
-    """Remove temp files older than 1 hour."""
-    while True:
-        await asyncio.sleep(300)  # Check every 5 minutes
-        cutoff = time.time() - 3600
-        for d in [UPLOAD_DIR, OUTPUT_DIR]:
-            if d.exists():
-                for item in d.iterdir():
-                    if item.is_dir() and item.stat().st_mtime < cutoff:
-                        shutil.rmtree(item, ignore_errors=True)
-
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    # Mask index page from public browser visitors if API key is active
-    if CONVERTER_API_KEY:
-        token = request.headers.get("X-API-Key") or request.query_params.get("api_key")
-        if token != CONVERTER_API_KEY:
-            return HTMLResponse("<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>", status_code=404)
+    if not _is_authorized(request):
+        return HTMLResponse("<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>", status_code=404)
     return templates.TemplateResponse("index.html", {"request": request})
+
+
+def _sanitize_upload_filename(raw_filename: str | None) -> str:
+    """Strip directory components (POSIX and Windows) from uploaded filenames."""
+    if not raw_filename:
+        return ""
+    name = Path(raw_filename.replace("\\", "/")).name.strip()
+    if name in ("", ".", ".."):
+        return ""
+    return name
 
 
 @app.post("/upload")
@@ -121,18 +185,19 @@ async def upload_files(files: list[UploadFile] = File(...)):
     results = []
 
     for file in files:
-        if not file.filename or not file.filename.lower().endswith('.epub'):
+        safe_filename = _sanitize_upload_filename(file.filename)
+        if not safe_filename or not safe_filename.lower().endswith('.epub'):
             results.append({
-                "filename": file.filename,
+                "filename": safe_filename or file.filename,
                 "error": "Not an EPUB file",
                 "task_id": None,
             })
             continue
 
         # Check for .kepub.epub
-        if file.filename.lower().endswith('.kepub.epub'):
+        if safe_filename.lower().endswith('.kepub.epub'):
             results.append({
-                "filename": file.filename,
+                "filename": safe_filename,
                 "error": "Kobo EPUB files (.kepub.epub) are not supported",
                 "task_id": None,
             })
@@ -142,20 +207,38 @@ async def upload_files(files: list[UploadFile] = File(...)):
         task_dir = UPLOAD_DIR / task_id
         task_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save uploaded file
-        file_path = task_dir / file.filename
-        content = await file.read()
-
-        if len(content) > MAX_FILE_SIZE:
+        # Save uploaded file via bounded streaming to avoid loading full file into RAM
+        file_path = task_dir / safe_filename
+        if file_path.resolve().parent != task_dir.resolve():
+            shutil.rmtree(task_dir, ignore_errors=True)
             results.append({
-                "filename": file.filename,
-                "error": f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)",
+                "filename": safe_filename,
+                "error": "Invalid filename",
                 "task_id": None,
             })
             continue
 
+        total_size = 0
+        too_large = False
         with open(file_path, 'wb') as f:
-            f.write(content)
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_FILE_SIZE:
+                    too_large = True
+                    break
+                f.write(chunk)
+
+        if too_large:
+            shutil.rmtree(task_dir, ignore_errors=True)
+            results.append({
+                "filename": safe_filename,
+                "error": f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)",
+                "task_id": None,
+            })
+            continue
 
         # Extract metadata for preview
         try:
@@ -165,15 +248,16 @@ async def upload_files(files: list[UploadFile] = File(...)):
 
         tasks[task_id] = {
             "status": "uploaded",
-            "filename": file.filename,
+            "filename": safe_filename,
             "file_path": str(file_path),
-            "file_size": len(content),
+            "file_size": total_size,
+            "created_at": time.time(),
         }
 
         results.append({
-            "filename": file.filename,
+            "filename": safe_filename,
             "task_id": task_id,
-            "file_size": len(content),
+            "file_size": total_size,
             "metadata": metadata,
             "error": metadata.get("error"),
         })

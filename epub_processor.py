@@ -22,7 +22,7 @@ from metadata_handler import (
 from html_cleaner import (
     repair_html, remove_unused_css, collect_used_selectors,
     remove_embedded_fonts_from_css, find_font_files, normalize_whitespace,
-    add_chapter_page_breaks, strip_unnecessary_attributes
+    add_chapter_page_breaks, strip_unnecessary_attributes, xml_parser
 )
 from text_cleaner import clean_text_content, TextCleanOptions, TextCleanReport
 from epub_packager import (
@@ -168,7 +168,7 @@ def process_epub(input_path: str, output_path: str,
         _progress(8, "Parsing structure...")
         opf_rel_path = find_opf_path(work_dir)
         opf_path = os.path.join(work_dir, opf_rel_path)
-        opf_tree = etree.parse(opf_path)
+        opf_tree = etree.parse(opf_path, xml_parser())
 
         # Step 4: Extract metadata
         _progress(10, "Reading metadata...")
@@ -179,7 +179,7 @@ def process_epub(input_path: str, output_path: str,
             update_metadata(opf_tree, options.metadata_edits)
             opf_tree.write(opf_path, xml_declaration=True, encoding='utf-8', pretty_print=True)
             # Re-read metadata for filename generation
-            opf_tree = etree.parse(opf_path)
+            opf_tree = etree.parse(opf_path, xml_parser())
             metadata = extract_metadata(opf_tree)
 
         # Step 6: Find all content files
@@ -262,7 +262,7 @@ def process_epub(input_path: str, output_path: str,
         # Step 9: Generate missing cover (64%)
         if options.generate_missing_cover:
             _progress(64, "Checking cover...")
-            opf_tree = etree.parse(opf_path)
+            opf_tree = etree.parse(opf_path, xml_parser())
             meta = extract_metadata(opf_tree)
             if not meta['cover_href']:
                 title = options.metadata_edits.get('title', meta['title']) or 'Untitled'
@@ -404,7 +404,7 @@ def process_epub(input_path: str, output_path: str,
         # Step 16: Clean metadata (88%)
         if options.clean_metadata:
             _progress(87, "Cleaning metadata...")
-            opf_tree = etree.parse(opf_path)
+            opf_tree = etree.parse(opf_path, xml_parser())
             report.metadata_items_stripped = strip_store_metadata(opf_tree)
             if report.metadata_items_stripped > 0:
                 opf_tree.write(opf_path, xml_declaration=True, encoding='utf-8', pretty_print=True)
@@ -423,7 +423,7 @@ def process_epub(input_path: str, output_path: str,
         package_epub(work_dir, output_path)
 
         # Step 20: Generate output filename
-        opf_tree = etree.parse(opf_path)
+        opf_tree = etree.parse(opf_path, xml_parser())
         final_metadata = extract_metadata(opf_tree)
         title = options.metadata_edits.get('title', final_metadata['title']) or final_metadata['title']
         author = options.metadata_edits.get('author', final_metadata['author']) or final_metadata['author']
@@ -484,7 +484,7 @@ def extract_epub_metadata(epub_path: str) -> dict:
         extract_epub(epub_path, work_dir)
         opf_rel = find_opf_path(work_dir)
         opf_path = os.path.join(work_dir, opf_rel)
-        opf_tree = etree.parse(opf_path)
+        opf_tree = etree.parse(opf_path, xml_parser())
 
         metadata = extract_metadata(opf_tree)
         result.update(metadata)
