@@ -240,9 +240,9 @@ async def upload_files(files: list[UploadFile] = File(...)):
             })
             continue
 
-        # Extract metadata for preview
+        # Extract metadata for preview off the event loop (zero disk extraction)
         try:
-            metadata = extract_epub_metadata(str(file_path))
+            metadata = await asyncio.to_thread(extract_epub_metadata, str(file_path))
         except Exception as e:
             metadata = {"title": "", "author": "", "error": str(e)}
 
@@ -278,6 +278,12 @@ async def process_sse(
     generate_cover: bool = True,
     clean_metadata: bool = True,
     text_cleanup: bool = True,
+    standardize_layout: bool = True,
+    trim_matter: bool = True,
+    split_chapters: bool = True,
+    normalize_scene_breaks: bool = True,
+    preserve_typography: bool = True,
+    preset: str = "story",
     edit_title: str = "",
     edit_author: str = "",
     filename_format: str = "author-title",
@@ -295,6 +301,8 @@ async def process_sse(
     if device not in DEVICE_PROFILES:
         allowed = ", ".join(f"'{d}'" for d in DEVICE_PROFILES)
         raise HTTPException(status_code=400, detail=f"Unknown device (expected {allowed})")
+    if preset not in ("story", "nonfiction", "classic"):
+        raise HTTPException(status_code=400, detail="Unknown preset (expected 'story', 'nonfiction', or 'classic')")
     if filename_format not in FILENAME_FORMATS:
         raise HTTPException(status_code=400, detail="Unknown filename format")
     if filename_format == "custom" and not filename_template.strip():
@@ -330,6 +338,12 @@ async def process_sse(
         generate_missing_cover=generate_cover,
         clean_metadata=clean_metadata,
         text_cleanup=text_cleanup,
+        standardize_layout=standardize_layout,
+        trim_matter=trim_matter,
+        split_chapters=split_chapters,
+        normalize_scene_breaks=normalize_scene_breaks,
+        preserve_typography=preserve_typography,
+        preset=preset,
         filename_format=filename_format,
         filename_template=filename_template,
         original_filename=task["filename"],
@@ -371,7 +385,10 @@ async def process_sse(
                 if update.get("percent", 0) >= 100:
                     done = True
             except asyncio.TimeoutError:
-                yield f": keepalive\n\n"
+                if future.done() and queue.empty():
+                    done = True
+                else:
+                    yield f": keepalive\n\n"
 
         report: ProcessingReport = await future
 
@@ -397,6 +414,17 @@ async def process_sse(
                 "attrs_stripped": report.attrs_stripped,
                 "text_fixes_total": report.text_fixes_total,
                 "text_cleanup_summary": report.text_cleanup_summary,
+                "word_count_raw": report.word_count_raw,
+                "word_count_story": report.word_count_story,
+                "chapter_count": report.chapter_count,
+                "reading_minutes": report.reading_minutes,
+                "files_trimmed": report.files_trimmed,
+                "words_trimmed": report.words_trimmed,
+                "chapters_split": report.chapters_split,
+                "scene_breaks_normalized": report.scene_breaks_normalized,
+                "dead_footnotes_removed": report.dead_footnotes_removed,
+                "orphan_images_removed": report.orphan_images_removed,
+                "warnings": report.warnings,
             }
         }
 
@@ -404,6 +432,8 @@ async def process_sse(
         task["report"] = final["report"]
         task["output_path"] = output_path
         task["output_filename"] = report.output_filename
+        if report.success:
+            shutil.rmtree(Path(input_path).parent, ignore_errors=True)
 
         yield f"data: {json.dumps(final)}\n\n"
 

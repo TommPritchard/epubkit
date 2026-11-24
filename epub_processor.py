@@ -3,12 +3,18 @@ Main EPUB processing pipeline for Xteink Optimizer (X4, X3).
 Orchestrates all processing steps and generates validation reports.
 """
 
+import base64
+import gc
 import os
+import posixpath
+import re
 import shutil
 import tempfile
+import zipfile
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
+from urllib.parse import unquote
 
 from lxml import etree
 
@@ -31,7 +37,17 @@ from epub_packager import (
 from epub_structure import (
     build_rename_map, update_opf, update_opf_remove_fonts,
     update_xhtml_references, update_css_references,
-    fix_svg_covers, fix_toc, find_content_files, add_image_to_opf
+    fix_svg_covers, fix_toc, find_content_files, add_image_to_opf,
+    sanitize_package_manifest_and_files, _find_element, _is_element,
+)
+from matter_trimmer import (
+    trim_epub_matter, count_words, extract_clean_text,
+    parse_xhtml_safe, get_body, is_cover_stem, local_name,
+)
+from chapter_splitter import split_oversized_chapters
+from house_style import (
+    apply_house_style, ensure_cover_entry,
+    HOUSE_STYLE_FILENAME, COVER_PAGE_FILENAME, TITLE_PAGE_FILENAME,
 )
 
 
@@ -52,6 +68,13 @@ class ProcessingOptions:
     clean_metadata: bool = True
     text_cleanup: bool = True
     normalize_quotes: bool = True
+    # Story-First Standardization Engine options
+    standardize_layout: bool = True
+    trim_matter: bool = True
+    split_chapters: bool = True
+    normalize_scene_breaks: bool = True
+    preserve_typography: bool = True
+    preset: str = 'story'  # 'story' (Pure Story), 'nonfiction' (Keep Notes & Intro), or 'classic' (Original X4 Optimizer)
     filename_format: str = 'author-title'
     filename_template: str = ''
     original_filename: str = ''
@@ -67,6 +90,17 @@ class ProcessingReport:
     original_size: int = 0
     optimized_size: int = 0
     output_filename: str = ''
+    # Word & structure metrics
+    word_count_raw: int = 0
+    word_count_story: int = 0
+    chapter_count: int = 0
+    reading_minutes: int = 0
+    files_trimmed: int = 0
+    words_trimmed: int = 0
+    chapters_split: int = 0
+    scene_breaks_normalized: int = 0
+    dead_footnotes_removed: int = 0
+    orphan_images_removed: int = 0
     # Counts
     images_converted: int = 0
     images_total: int = 0
@@ -82,12 +116,30 @@ class ProcessingReport:
     text_cleanup_summary: str = ''
     os_artifacts_removed: int = 0
     cover_generated: bool = False
-    # Details
+    # Details & source warnings
     image_details: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 
     def summary(self) -> str:
         """Generate a human-readable summary of all changes."""
         parts = []
+
+        if self.word_count_story > 0:
+            hrs, mins = divmod(self.reading_minutes, 60)
+            time_str = f"~{hrs}h {mins:02d}m" if hrs else f"~{mins}m"
+            parts.append(f"Story: {self.word_count_story:,} words ({self.chapter_count} ch, {time_str})")
+
+        if self.files_trimmed > 0:
+            parts.append(f"Trimmed {self.files_trimmed} non-story files ({self.words_trimmed:,} words)")
+
+        if self.chapters_split > 0:
+            parts.append(f"Split into {self.chapters_split} chapters")
+
+        if self.scene_breaks_normalized > 0:
+            parts.append(f"Standardized {self.scene_breaks_normalized} scene breaks")
+
+        if self.dead_footnotes_removed > 0:
+            parts.append(f"Cleaned {self.dead_footnotes_removed} dead footnote markers")
 
         if self.images_converted > 0:
             fmt_parts = [f"{v} {k}" for k, v in self.image_formats.items()]
@@ -141,6 +193,17 @@ def process_epub(input_path: str, output_path: str,
     """
     if options is None:
         options = ProcessingOptions()
+    if options.preset == 'classic':
+        # Copy so caller's ProcessingOptions instance is not mutated;
+        # Classic mode runs the original pre-Story-First X4 optimizer.
+        options = replace(
+            options,
+            standardize_layout=False,
+            trim_matter=False,
+            split_chapters=False,
+            normalize_scene_breaks=False,
+            preserve_typography=False,
+        )
 
     report = ProcessingReport()
     report.original_size = os.path.getsize(input_path)
@@ -182,11 +245,73 @@ def process_epub(input_path: str, output_path: str,
             opf_tree = etree.parse(opf_path, xml_parser())
             metadata = extract_metadata(opf_tree)
 
-        # Step 6: Find all content files
+        # Step 6a: Trim non-story front/back matter & prune orphaned images BEFORE image processing
+        cover_xhtml_rel = None
+        if options.trim_matter:
+            _progress(11, "Trimming non-story front/back matter...")
+            trim_rep = trim_epub_matter(
+                work_dir, opf_path,
+                preset=options.preset,
+                original_filename=options.original_filename,
+            )
+            report.word_count_raw = trim_rep.raw_words
+            report.files_trimmed = trim_rep.files_trimmed
+            report.words_trimmed = trim_rep.trimmed_words
+            report.dead_footnotes_removed = trim_rep.dead_footnotes_removed
+            report.orphan_images_removed += trim_rep.orphan_images_removed
+            report.warnings.extend(trim_rep.warnings)
+            cover_xhtml_rel = trim_rep.cover_xhtml_rel
+        else:
+            report.word_count_raw = _count_spine_words(opf_path)
+
+        # Step 6b: Split oversized multi-chapter XHTML files & trim glued trailing promos
+        if options.split_chapters or options.trim_matter:
+            _progress(13, "Checking chapter splits...")
+            split_rep = split_oversized_chapters(
+                work_dir, opf_path,
+                cover_xhtml_rel=cover_xhtml_rel,
+                split_enabled=options.split_chapters,
+            )
+            report.chapters_split = split_rep.chapters_created
+            report.words_trimmed += split_rep.trailing_promo_trimmed_words
+
+            if options.trim_matter and split_rep.files_split > 0:
+                _progress(14, "Trimming front/back matter from split chapters...")
+                trim_rep2 = trim_epub_matter(
+                    work_dir, opf_path,
+                    preset=options.preset,
+                    original_filename=options.original_filename,
+                )
+                report.files_trimmed += trim_rep2.files_trimmed
+                report.words_trimmed += trim_rep2.trimmed_words
+                report.dead_footnotes_removed += trim_rep2.dead_footnotes_removed
+                report.orphan_images_removed += trim_rep2.orphan_images_removed
+                cover_xhtml_rel = trim_rep2.cover_xhtml_rel or cover_xhtml_rel
+                if trim_rep2.files_trimmed > 0:
+                    _renumber_trimmed_section_splits(opf_path)
+
+        # Step 6c: Apply X4 Bookerly House Style & normalize scene breaks (incl. ornament images -> <hr>)
+        # Runs BEFORE image processing so ornament & deleted images are pruned before Pillow runs!
+        if options.standardize_layout or options.normalize_scene_breaks:
+            _progress(15, "Applying X4 Bookerly House Style...")
+            hs_rep = apply_house_style(
+                work_dir, opf_path,
+                standardize_layout=options.standardize_layout,
+                normalize_scene_breaks=options.normalize_scene_breaks,
+                cover_xhtml_rel=cover_xhtml_rel,
+                ensure_title_page=options.standardize_layout,
+            )
+            report.scene_breaks_normalized = hs_rep.scene_breaks_normalized
+            report.orphan_images_removed += hs_rep.orphan_images_removed
+
+        # Step 6d: Find surviving content files AFTER trimming/splitting/ornament pruning
         content_files = find_content_files(work_dir, opf_path)
 
         # Step 7: Process images (20-60%)
-        _progress(15, "Processing images...")
+        _progress(18, "Processing images...")
+        if options.standardize_layout and not metadata.get('cover_href'):
+            # Re-read OPF in case ensure_cover_entry discovered & registered a hash-named cover image
+            metadata = extract_metadata(etree.parse(opf_path, xml_parser()))
         opf_dir_norm = os.path.normpath(str(Path(opf_path).parent))
         cover_abs_norm = (
             os.path.normpath(os.path.join(opf_dir_norm, metadata['cover_href']))
@@ -249,8 +374,8 @@ def process_epub(input_path: str, output_path: str,
                         if os.path.exists(img_path):
                             os.unlink(img_path)
 
-                    # Track for reference updates
-                    old_rel = os.path.relpath(img_path, Path(opf_path).parent)
+                    # Track for reference updates (POSIX slashes so OPF hrefs match on Windows)
+                    old_rel = os.path.relpath(img_path, Path(opf_path).parent).replace('\\', '/')
                     processed_images[old_rel] = result.new_filename
 
                     report.image_details.append(result.details)
@@ -274,22 +399,35 @@ def process_epub(input_path: str, output_path: str,
                     gray_levels=profile['gray_levels'] if options.eink_quantize else None,
                 )
                 opf_dir = str(Path(opf_path).parent)
-                # Determine images directory
-                images_dir = os.path.join(opf_dir, 'images')
-                if not os.path.exists(images_dir):
-                    images_dir = os.path.join(opf_dir, 'Images')
-                    if not os.path.exists(images_dir):
-                        images_dir = os.path.join(opf_dir, 'images')
-                        os.makedirs(images_dir, exist_ok=True)
+                # Respect exact on-disk casing (Windows is case-insensitive so os.path.exists('images') matches 'Images')
+                existing_img_dir = next(
+                    (
+                        d for d in os.listdir(opf_dir)
+                        if d.lower() == 'images' and os.path.isdir(os.path.join(opf_dir, d))
+                    ),
+                    None,
+                )
+                images_dir = os.path.join(opf_dir, existing_img_dir or 'images')
+                os.makedirs(images_dir, exist_ok=True)
 
                 cover_path = os.path.join(images_dir, 'cover_generated.jpg')
                 with open(cover_path, 'wb') as f:
                     f.write(cover_bytes)
 
                 # Add to OPF
-                cover_href = os.path.relpath(cover_path, opf_dir)
+                cover_href = os.path.relpath(cover_path, opf_dir).replace('\\', '/')
                 add_image_to_opf(opf_path, cover_href, 'cover-image-generated')
                 report.cover_generated = True
+                if options.standardize_layout:
+                    ensure_cover_entry(
+                        opf_path,
+                        title=title,
+                        author=author,
+                        lang=meta.get('language', ''),
+                        ensure_title_page=True,
+                        cover_xhtml_rel=cover_xhtml_rel,
+                    )
+                    content_files = find_content_files(work_dir, opf_path)
 
         # Step 10: Update references (68%)
         _progress(68, "Updating references...")
@@ -306,36 +444,59 @@ def process_epub(input_path: str, output_path: str,
                 if os.path.exists(css_path):
                     update_css_references(css_path, rename_map)
 
-        # Step 11: Repair HTML + strip unnecessary attributes (70%)
-        _progress(70, "Repairing HTML...")
+        # Step 11-15 (Fused single-pass XHTML cleanup): Repair, strip attrs, normalize whitespace,
+        # clean text, and collect used CSS selectors in ONE disk read + write per file!
+        _progress(70, "Repairing, normalizing & cleaning XHTML...")
+        all_classes = set()
+        all_ids = set()
+        all_elements = set()
+        text_opts = TextCleanOptions(
+            normalize_quotes=options.normalize_quotes,
+            preserve_smart_typography=options.preserve_typography,
+        ) if options.text_cleanup else None
+        aggregate_text_report = TextCleanReport()
+
         for xhtml_path in content_files['xhtml']:
-            if os.path.exists(xhtml_path):
-                with open(xhtml_path, 'rb') as f:
-                    html_bytes = f.read()
-                repaired = repair_html(html_bytes)
-                # Strip decorative attributes (data-*, aria-*, etc) for 380KB RAM device
-                repaired, stripped = strip_unnecessary_attributes(repaired)
-                report.attrs_stripped += stripped
+            if not os.path.exists(xhtml_path):
+                continue
+            with open(xhtml_path, 'rb') as f:
+                orig_bytes = f.read()
+
+            cur = repair_html(orig_bytes)
+            cur, stripped = strip_unnecessary_attributes(cur)
+            report.attrs_stripped += stripped
+
+            cur, ws_removed = normalize_whitespace(cur)
+            report.whitespace_cleaned += ws_removed
+            if not options.standardize_layout:
+                cur = add_chapter_page_breaks(cur)
+
+            if text_opts is not None:
+                cur, text_report = clean_text_content(cur, text_opts)
+                if text_report.total_fixes > 0:
+                    aggregate_text_report.merge(text_report)
+
+            if options.remove_unused_css:
+                classes, ids, elements = collect_used_selectors(cur)
+                all_classes.update(classes)
+                all_ids.update(ids)
+                all_elements.update(elements)
+
+            if cur != orig_bytes:
                 with open(xhtml_path, 'wb') as f:
-                    f.write(repaired)
+                    f.write(cur)
 
-        # Step 12: Remove unused CSS (74%)
+        if options.text_cleanup:
+            report.text_fixes_total = aggregate_text_report.total_fixes
+            report.text_cleanup_summary = aggregate_text_report.summary()
+
+        # Step 12: Remove unused CSS (78%)
         if options.remove_unused_css:
-            _progress(76, "Removing unused CSS...")
-            # Collect all used selectors from XHTML files
-            all_classes = set()
-            all_ids = set()
-            all_elements = set()
-            for xhtml_path in content_files['xhtml']:
-                if os.path.exists(xhtml_path):
-                    with open(xhtml_path, 'rb') as f:
-                        classes, ids, elements = collect_used_selectors(f.read())
-                        all_classes.update(classes)
-                        all_ids.update(ids)
-                        all_elements.update(elements)
-
+            _progress(78, "Removing unused CSS...")
             for css_path in content_files['css']:
                 if os.path.exists(css_path):
+                    if Path(css_path).name == HOUSE_STYLE_FILENAME:
+                        continue
                     with open(css_path, 'r', encoding='utf-8', errors='ignore') as f:
                         css_text = f.read()
                     cleaned, removed = remove_unused_css(css_text, all_classes, all_ids, all_elements)
@@ -344,9 +505,9 @@ def process_epub(input_path: str, output_path: str,
                         with open(css_path, 'w', encoding='utf-8') as f:
                             f.write(cleaned)
 
-        # Step 13: Remove embedded fonts (80%)
+        # Step 13: Remove embedded fonts (82%)
         if options.remove_fonts:
-            _progress(80, "Removing embedded fonts...")
+            _progress(82, "Removing embedded fonts...")
             font_files = content_files['fonts']
 
             if font_files:
@@ -370,37 +531,6 @@ def process_epub(input_path: str, output_path: str,
                 # Remove from OPF manifest
                 update_opf_remove_fonts(opf_path, font_files)
 
-        # Step 14: Normalize whitespace and page breaks (82%)
-        _progress(82, "Normalizing content...")
-        for xhtml_path in content_files['xhtml']:
-            if os.path.exists(xhtml_path):
-                with open(xhtml_path, 'rb') as f:
-                    html_bytes = f.read()
-                cleaned, removed = normalize_whitespace(html_bytes)
-                report.whitespace_cleaned += removed
-                cleaned = add_chapter_page_breaks(cleaned)
-                with open(xhtml_path, 'wb') as f:
-                    f.write(cleaned)
-
-        # Step 15: Text content cleanup (85%)
-        if options.text_cleanup:
-            _progress(85, "Cleaning text content...")
-            text_opts = TextCleanOptions(normalize_quotes=options.normalize_quotes)
-            aggregate_report = TextCleanReport()
-
-            for xhtml_path in content_files['xhtml']:
-                if os.path.exists(xhtml_path):
-                    with open(xhtml_path, 'rb') as f:
-                        html_bytes = f.read()
-                    cleaned, text_report = clean_text_content(html_bytes, text_opts)
-                    if text_report.total_fixes > 0:
-                        with open(xhtml_path, 'wb') as f:
-                            f.write(cleaned)
-                        aggregate_report.merge(text_report)
-
-            report.text_fixes_total = aggregate_report.total_fixes
-            report.text_cleanup_summary = aggregate_report.summary()
-
         # Step 16: Clean metadata (88%)
         if options.clean_metadata:
             _progress(87, "Cleaning metadata...")
@@ -409,10 +539,21 @@ def process_epub(input_path: str, output_path: str,
             if report.metadata_items_stripped > 0:
                 opf_tree.write(opf_path, xml_declaration=True, encoding='utf-8', pretty_print=True)
 
-        # Step 17: Fix TOC (90%)
-        _progress(90, "Checking TOC...")
-        toc_fixed, toc_msg = fix_toc(work_dir, opf_path)
+        # Step 17: Fix / Rebuild Dual TOC (90%)
+        _progress(90, "Rebuilding TOC...")
+        rebuild_toc = options.trim_matter or options.split_chapters or options.standardize_layout
+        toc_fixed, toc_msg = fix_toc(work_dir, opf_path, force_rebuild=rebuild_toc)
         report.toc_status = toc_msg
+
+        # Step 17a: Package hygiene (dedup manifest IDs/hrefs, prune missing files & unmanifested clutter)
+        sanitize_package_manifest_and_files(work_dir, opf_path)
+
+        # Step 17b: Compute final story word count, chapter count & reading time (92%)
+        _progress(92, "Counting story words...")
+        story_words, ch_count = _count_story_metrics(opf_path)
+        report.word_count_story = story_words
+        report.chapter_count = ch_count
+        report.reading_minutes = max(1, round(story_words / 250)) if story_words > 0 else 0
 
         # Step 18: Clean OS artifacts (93%)
         _progress(93, "Cleaning up...")
@@ -451,14 +592,23 @@ def process_epub(input_path: str, output_path: str,
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+        gc.collect()
 
     return report
 
 
+def _find_zip_entry(namelist: list[str], target_rel: str) -> Optional[str]:
+    norm = posixpath.normpath(target_rel.replace('\\', '/')).lstrip('./')
+    if norm in namelist:
+        return norm
+    low_map = {n.lower(): n for n in namelist}
+    return low_map.get(norm.lower())
+
+
 def extract_epub_metadata(epub_path: str) -> dict:
     """
-    Quick metadata extraction without full processing.
-    Used for the preview step in the web UI.
+    Quick metadata extraction directly from the ZIP archive without disk extraction.
+    Used for the preview step in the web UI (Render 512 MB RAM & I/O safe).
     Returns: {title, author, series, series_index, language, cover_id, cover_href, cover_data, has_drm}
     """
     result = {
@@ -479,32 +629,148 @@ def extract_epub_metadata(epub_path: str) -> dict:
     if result['has_drm']:
         return result
 
-    work_dir = tempfile.mkdtemp(prefix='epub_meta_')
     try:
-        extract_epub(epub_path, work_dir)
-        opf_rel = find_opf_path(work_dir)
-        opf_path = os.path.join(work_dir, opf_rel)
-        opf_tree = etree.parse(opf_path, xml_parser())
+        with zipfile.ZipFile(epub_path, 'r') as zf:
+            names = zf.namelist()
+            opf_rel: Optional[str] = None
+            container_name = _find_zip_entry(names, 'META-INF/container.xml')
+            if container_name:
+                c_root = etree.fromstring(zf.read(container_name), xml_parser())
+                for el in c_root.iter():
+                    if isinstance(el.tag, str) and (el.tag.endswith('}rootfile') or el.tag == 'rootfile'):
+                        cand = (el.get('full-path') or '').strip()
+                        if cand:
+                            opf_rel = _find_zip_entry(names, unquote(cand))
+                            break
+            if not opf_rel:
+                opf_rel = next((n for n in names if n.lower().endswith('.opf')), None)
+            if not opf_rel:
+                return result
 
-        metadata = extract_metadata(opf_tree)
-        result.update(metadata)
+            opf_root = etree.fromstring(zf.read(opf_rel), xml_parser())
+            metadata = extract_metadata(etree.ElementTree(opf_root))
+            result.update(metadata)
 
-        # Extract cover image data for preview
-        if metadata['cover_href']:
-            opf_dir = str(Path(opf_path).parent)
-            cover_path = os.path.join(opf_dir, metadata['cover_href'])
-            if os.path.exists(cover_path):
-                import base64
-                with open(cover_path, 'rb') as f:
-                    cover_bytes = f.read()
-                result['cover_data'] = base64.b64encode(cover_bytes).decode('ascii')
+            # Extract cover image bytes directly (guarded at <= 5 MB)
+            if metadata['cover_href']:
+                opf_dir = posixpath.dirname(opf_rel)
+                clean_cov = unquote(metadata['cover_href']).replace('\\', '/')
+                cov_rel = posixpath.join(opf_dir, clean_cov) if opf_dir else clean_cov
+                cov_entry = _find_zip_entry(names, cov_rel)
+                if cov_entry and zf.getinfo(cov_entry).file_size <= 5 * 1024 * 1024:
+                    result['cover_data'] = base64.b64encode(zf.read(cov_entry)).decode('ascii')
 
     except Exception:
         pass
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
 
     return result
+
+
+def _renumber_trimmed_section_splits(opf_path: str) -> None:
+    """Re-sequence surviving fallback 'Section N' split titles from Section 1 without retaining DOM trees in RAM."""
+    try:
+        opf_tree = etree.parse(opf_path, xml_parser())
+    except Exception:
+        return
+    opf_root = opf_tree.getroot()
+    opf_dir = str(Path(opf_path).parent)
+    manifest = _find_element(opf_root, 'manifest')
+    spine = _find_element(opf_root, 'spine')
+    if manifest is None or spine is None:
+        return
+
+    id_to_href = {
+        it.get('id', ''): posixpath.normpath(unquote(it.get('href', '')).replace('\\', '/'))
+        for it in manifest if _is_element(it)
+    }
+
+    groups: dict[str, list[tuple[str, int]]] = {}
+    for itemref in spine:
+        if not _is_element(itemref):
+            continue
+        rel = id_to_href.get(itemref.get('idref', ''), '')
+        m_ch = re.match(r'^(.+)_ch\d+$', Path(rel).stem, re.I)
+        if not rel or not m_ch:
+            continue
+        stem_key = posixpath.join(posixpath.dirname(rel), m_ch.group(1))
+        abs_p = os.path.join(opf_dir, rel)
+        if not os.path.exists(abs_p):
+            continue
+        root, _ = parse_xhtml_safe(Path(abs_p).read_bytes())
+        title_el = next(
+            (el for el in root.iter() if _is_element(el) and local_name(el.tag) == 'title'),
+            None,
+        )
+        t_txt = ' '.join((title_el.text or '').split()) if title_el is not None else ''
+        m_sec = re.match(r'^Section\s+(\d+)$', t_txt, re.I)
+        sec_num = int(m_sec.group(1)) if (m_sec and title_el is not None) else 0
+        groups.setdefault(stem_key, []).append((abs_p, sec_num))
+
+    for entries in groups.values():
+        if not entries or entries[0][1] <= 1 or not all(sec > 0 for _, sec in entries):
+            continue
+        for seq, (abs_p, cur_sec) in enumerate(entries, 1):
+            if cur_sec == seq:
+                continue
+            root, _ = parse_xhtml_safe(Path(abs_p).read_bytes())
+            title_el = next(
+                (el for el in root.iter() if _is_element(el) and local_name(el.tag) == 'title'),
+                None,
+            )
+            if title_el is not None:
+                title_el.text = f"Section {seq}"
+                Path(abs_p).write_bytes(
+                    etree.tostring(root, xml_declaration=True, encoding='utf-8', pretty_print=True)
+                )
+
+
+def _count_spine_words(opf_path: str) -> int:
+    """Count total words across all spine XHTML files."""
+    total, _ = _count_story_metrics(opf_path, exclude_entry_pages=False)
+    return total
+
+
+def _count_story_metrics(opf_path: str, exclude_entry_pages: bool = True) -> tuple[int, int]:
+    """Stream spine XHTML files one at a time and return (story_words, chapter_count)."""
+    from urllib.parse import unquote
+    try:
+        opf_tree = etree.parse(opf_path, xml_parser())
+    except Exception:
+        return 0, 0
+    root = opf_tree.getroot()
+    opf_dir = str(Path(opf_path).parent)
+    manifest = _find_element(root, 'manifest')
+    spine = _find_element(root, 'spine')
+    if manifest is None or spine is None:
+        return 0, 0
+
+    id_to_href = {
+        it.get('id', ''): unquote(it.get('href', ''))
+        for it in manifest if _is_element(it)
+    }
+
+    total_words = 0
+    chapter_count = 0
+    for idx, itemref in enumerate(spine):
+        if not _is_element(itemref):
+            continue
+        href = id_to_href.get(itemref.get('idref', ''), '')
+        if not href:
+            continue
+        bname = Path(href).name
+        if exclude_entry_pages and bname in (COVER_PAGE_FILENAME, TITLE_PAGE_FILENAME):
+            continue
+        abs_p = os.path.join(opf_dir, href)
+        if not os.path.exists(abs_p):
+            continue
+        doc, _ = parse_xhtml_safe(Path(abs_p).read_bytes())
+        w = count_words(extract_clean_text(get_body(doc)))
+        if exclude_entry_pages and idx == 0 and w < 20 and is_cover_stem(href):
+            continue
+        total_words += w
+        chapter_count += 1
+
+    return total_words, chapter_count
 
 
 def _fmt_size(size_bytes: int) -> str:

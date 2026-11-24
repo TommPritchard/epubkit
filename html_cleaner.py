@@ -272,6 +272,9 @@ def normalize_whitespace(xhtml_bytes: bytes) -> tuple[bytes, int]:
                 parent.remove(empty_el)
                 removed += 1
 
+    if removed == 0:
+        return xhtml_bytes, 0
+
     result = etree.tostring(tree, encoding='unicode', pretty_print=True)
     return result.encode('utf-8'), removed
 

@@ -9,7 +9,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from lxml import etree
 
-from html_cleaner import recovery_parser
+from html_cleaner import recovery_parser, xml_parser
 
 
 @dataclass
@@ -54,9 +54,14 @@ class TextCleanOptions:
     fix_whitespace: bool = True
     fix_ocr: bool = True
     normalize_quotes: bool = True
+    preserve_smart_typography: bool = False
+    strip_invisible_chars: bool = True
     fix_encoding: bool = True
     fix_punctuation: bool = True
     normalize_unicode: bool = True
+
+
+INVISIBLE_JUNK_CHARS = ('\u00ad', '\u200b', '\u200c', '\ufeff')
 
 
 # Common OCR ligature/artifact mappings
@@ -165,15 +170,25 @@ def _fix_mojibake(text: str) -> tuple[str, int]:
     return text, count
 
 
-def _fix_punctuation(text: str) -> tuple[str, int]:
+def _fix_punctuation(text: str, preserve_smart: bool = False) -> tuple[str, int]:
     """Fix common punctuation issues."""
     count = 0
-    # 4+ dots → ellipsis
-    result, n = re.subn(r'\.{4,}', '...', text)
-    count += n
-    # Missing space after sentence-ending punctuation before uppercase letter
-    result, n = re.subn(r'([.!?])([A-Z])', r'\1 \2', result)
-    count += n
+    if preserve_smart:
+        # Upgrade straight ellipses (...) and double hyphens (--) to Bookerly-native glyphs
+        result, n = re.subn(r'\.{3,}', '\u2026', text)
+        count += n
+        result, n = re.subn(r'(?<!-)--(?!-)', '\u2014', result)
+        count += n
+        # Avoid splitting initials like "J.R." or "U.S.A."
+        result, n = re.subn(r'(?<![A-Z])([.!?])([A-Z][a-z])', r'\1 \2', result)
+        count += n
+    else:
+        # 4+ dots → ellipsis
+        result, n = re.subn(r'\.{4,}', '...', text)
+        count += n
+        # Missing space after sentence-ending punctuation before uppercase letter
+        result, n = re.subn(r'([.!?])([A-Z])', r'\1 \2', result)
+        count += n
     # Multiple consecutive commas
     result, n = re.subn(r',{2,}', ',', result)
     count += n
@@ -181,6 +196,15 @@ def _fix_punctuation(text: str) -> tuple[str, int]:
     result, n = re.subn(r'([!?]){4,}', r'\1\1\1', result)
     count += n
     return result, count
+
+
+def _strip_invisible_junk(text: str) -> tuple[str, int]:
+    count = 0
+    for ch in INVISIBLE_JUNK_CHARS:
+        if ch in text:
+            count += text.count(ch)
+            text = text.replace(ch, '')
+    return text, count
 
 
 def _get_local_tag(tag: str) -> str:
@@ -203,7 +227,7 @@ def clean_text_content(xhtml_bytes: bytes, options: TextCleanOptions = None) -> 
     report = TextCleanReport()
 
     try:
-        tree = etree.fromstring(xhtml_bytes)
+        tree = etree.fromstring(xhtml_bytes, xml_parser())
     except etree.XMLSyntaxError:
         parser = recovery_parser(xhtml_bytes)
         tree = etree.fromstring(xhtml_bytes, parser)
@@ -213,23 +237,27 @@ def clean_text_content(xhtml_bytes: bytes, options: TextCleanOptions = None) -> 
     def _process_text(text: str) -> str:
         """Apply all enabled text fixes to a string."""
         nonlocal report
-        original = text
+
+        if options.strip_invisible_chars:
+            text, n = _strip_invisible_junk(text)
+            report.ocr_ligatures_fixed += n
+
+        if options.fix_encoding:
+            text, n = _fix_mojibake(text)
+            report.encoding_issues_fixed += n
 
         if options.fix_whitespace:
             text, n = _fix_whitespace(text)
             report.double_spaces_fixed += n
 
         if options.fix_ocr:
-            text, lig_n, quote_n = _fix_ocr_artifacts(text, options.normalize_quotes)
+            should_flatten = options.normalize_quotes and not options.preserve_smart_typography
+            text, lig_n, quote_n = _fix_ocr_artifacts(text, should_flatten)
             report.ocr_ligatures_fixed += lig_n
             report.smart_quotes_normalized += quote_n
 
-        if options.fix_encoding:
-            text, n = _fix_mojibake(text)
-            report.encoding_issues_fixed += n
-
         if options.fix_punctuation:
-            text, n = _fix_punctuation(text)
+            text, n = _fix_punctuation(text, preserve_smart=options.preserve_smart_typography)
             report.punctuation_fixed += n
 
         if options.normalize_unicode:

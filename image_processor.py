@@ -47,6 +47,7 @@ X4_HEIGHT = DEVICE_PROFILES['x4']['height']
 MAX_IMAGE_DIMENSION = 1024
 EINK_PALETTE_LEVELS = DEVICE_PROFILES['x4']['gray_levels']
 SUPPORTED_EXTENSIONS = {'.png', '.gif', '.webp', '.bmp', '.jpeg', '.jpg', '.tif', '.tiff'}
+Image.MAX_IMAGE_PIXELS = 40_000_000  # Guard Render 512MB RAM against huge decompression bombs
 
 
 @dataclass
@@ -533,7 +534,7 @@ def process_image(image_bytes: bytes, filename: str, options: ImageOptions = Non
     stem = Path(filename).stem
 
     try:
-        img = Image.open(io.BytesIO(image_bytes))
+        opened_img = Image.open(io.BytesIO(image_bytes))
     except Exception as e:
         return [ImageResult(
             output_bytes=image_bytes,
@@ -544,95 +545,117 @@ def process_image(image_bytes: bytes, filename: str, options: ImageOptions = Non
             details=f"Skipped (corrupt: {e})"
         )]
 
-    if getattr(img, 'is_animated', False):
-        img.seek(0)
-
-    if img.mode == 'CMYK':
-        img = img.convert('RGB')
-    if img.mode == '1':
-        img = img.convert('L')
-
-    img = _handle_transparency(img)
-
-    if options.light_novel_mode and not options.is_cover:
-        images = _handle_light_novel(img, options.light_novel_rotate_left)
-    else:
-        images = [img]
-
     results = []
-    for i, current_img in enumerate(images):
-        details_parts = []
-
-        if original_ext not in ('.jpg', '.jpeg'):
-            details_parts.append(f"{original_ext.upper().strip('.')}->JPEG")
-
-        orig_w, orig_h = current_img.size
-
-        # Clamp hard limit (1024x1024)
-        if orig_w > MAX_IMAGE_DIMENSION or orig_h > MAX_IMAGE_DIMENSION:
-            current_img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
-            clamped_w, clamped_h = current_img.size
-            details_parts.append(f"clamped {orig_w}x{orig_h}->{clamped_w}x{clamped_h}")
-            orig_w, orig_h = clamped_w, clamped_h
-
-        # Size handling: Smart Hybrid (0% stretch, 0% crop) for covers; proportional thumbnail for interior art
-        if options.is_cover:
-            current_img = _fit_cover_smart_hybrid(current_img, options.max_width, options.max_height)
-            details_parts.append(f"smart-hybrid {current_img.size[0]}x{current_img.size[1]}")
-        elif orig_w > options.max_width or orig_h > options.max_height:
-            current_img.thumbnail((options.max_width, options.max_height), Image.Resampling.LANCZOS)
-            new_w, new_h = current_img.size
-            details_parts.append(f"resized {orig_w}x{orig_h}->{new_w}x{new_h}")
-
-        if options.grayscale:
-            if current_img.mode != 'L':
-                current_img = _to_eink_grayscale(current_img)
-
-            sharpened_img, mapped_px = _enhance_for_eink(current_img, options)
-
-            if options.eink_quantize:
-                if list(options.gray_levels) == [0, 85, 170, 255]:
-                    current_img = _quantize_4level_serpentine(sharpened_img, mapped_px)
-                    details_parts.append("4-level serpentine dithered")
-                else:
-                    current_img = _quantize_to_levels(sharpened_img, options.gray_levels)
-                    details_parts.append(f"{len(options.gray_levels)}-level dithered")
-            else:
-                current_img = sharpened_img
-                details_parts.append("grayscale")
-
-            current_img = current_img.convert('RGB')
-        elif options.contrast_boost:
-            enhancer = ImageEnhance.Contrast(current_img)
-            current_img = enhancer.enhance(options.contrast_factor)
-            details_parts.append(f"contrast {options.contrast_factor}x")
-
-        effective_quality = max(options.quality, 92) if options.is_cover else max(options.quality, 85)
-        buffer = io.BytesIO()
-        current_img.save(
-            buffer,
-            format='JPEG',
-            quality=effective_quality,
-            progressive=False,
-            optimize=True,
-            subsampling=0
+    try:
+        pre_dim = (
+            MAX_IMAGE_DIMENSION * 2
+            if (options.light_novel_mode and not options.is_cover)
+            else MAX_IMAGE_DIMENSION
         )
-        output_bytes = buffer.getvalue()
+        raw_w, raw_h = opened_img.size
+        pre_clamped = False
+        is_anim = bool(getattr(opened_img, 'is_animated', False))
+        if is_anim:
+            opened_img.seek(0)
+        elif opened_img.format == 'JPEG' and (raw_w > pre_dim or raw_h > pre_dim):
+            try:
+                opened_img.draft('RGB', (pre_dim, pre_dim))
+            except Exception:
+                pass
 
-        if len(images) > 1:
-            new_filename = f"{stem}_part{i + 1}.jpg"
-            details_parts.insert(0, f"split part {i + 1}/{len(images)}")
+        if not is_anim and (opened_img.width > pre_dim or opened_img.height > pre_dim):
+            opened_img.thumbnail((pre_dim, pre_dim), Image.Resampling.LANCZOS)
+            pre_clamped = True
+
+        img = opened_img
+        if img.mode == 'CMYK':
+            img = img.convert('RGB')
+        if img.mode == '1':
+            img = img.convert('L')
+
+        img = _handle_transparency(img)
+
+        if options.light_novel_mode and not options.is_cover:
+            images = _handle_light_novel(img, options.light_novel_rotate_left)
         else:
-            new_filename = f"{stem}.jpg"
+            images = [img]
 
-        results.append(ImageResult(
-            output_bytes=output_bytes,
-            new_filename=new_filename,
-            original_size=original_size if i == 0 else 0,
-            new_size=len(output_bytes),
-            was_converted=True,
-            details=", ".join(details_parts) if details_parts else "baseline JPEG"
-        ))
+        for i, current_img in enumerate(images):
+            details_parts = []
+
+            if original_ext not in ('.jpg', '.jpeg'):
+                details_parts.append(f"{original_ext.upper().strip('.')}->JPEG")
+
+            orig_w, orig_h = current_img.size
+            if pre_clamped and len(images) == 1:
+                details_parts.append(f"clamped {raw_w}x{raw_h}->{orig_w}x{orig_h}")
+            elif orig_w > MAX_IMAGE_DIMENSION or orig_h > MAX_IMAGE_DIMENSION:
+                # Clamp hard limit (1024x1024) after Light Novel page splitting
+                current_img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
+                clamped_w, clamped_h = current_img.size
+                details_parts.append(f"clamped {orig_w}x{orig_h}->{clamped_w}x{clamped_h}")
+                orig_w, orig_h = clamped_w, clamped_h
+
+            # Size handling: Smart Hybrid (0% stretch, 0% crop) for covers; proportional thumbnail for interior art
+            if options.is_cover:
+                current_img = _fit_cover_smart_hybrid(current_img, options.max_width, options.max_height)
+                details_parts.append(f"smart-hybrid {current_img.size[0]}x{current_img.size[1]}")
+            elif orig_w > options.max_width or orig_h > options.max_height:
+                current_img.thumbnail((options.max_width, options.max_height), Image.Resampling.LANCZOS)
+                new_w, new_h = current_img.size
+                details_parts.append(f"resized {orig_w}x{orig_h}->{new_w}x{new_h}")
+
+            if options.grayscale:
+                if current_img.mode != 'L':
+                    current_img = _to_eink_grayscale(current_img)
+
+                sharpened_img, mapped_px = _enhance_for_eink(current_img, options)
+
+                if options.eink_quantize:
+                    if list(options.gray_levels) == [0, 85, 170, 255]:
+                        current_img = _quantize_4level_serpentine(sharpened_img, mapped_px)
+                        details_parts.append("4-level serpentine dithered")
+                    else:
+                        current_img = _quantize_to_levels(sharpened_img, options.gray_levels)
+                        details_parts.append(f"{len(options.gray_levels)}-level dithered")
+                else:
+                    current_img = sharpened_img
+                    details_parts.append("grayscale")
+
+                current_img = current_img.convert('RGB')
+            elif options.contrast_boost:
+                enhancer = ImageEnhance.Contrast(current_img)
+                current_img = enhancer.enhance(options.contrast_factor)
+                details_parts.append(f"contrast {options.contrast_factor}x")
+
+            effective_quality = max(options.quality, 92) if options.is_cover else max(options.quality, 85)
+            buffer = io.BytesIO()
+            current_img.save(
+                buffer,
+                format='JPEG',
+                quality=effective_quality,
+                progressive=False,
+                optimize=True,
+                subsampling=0
+            )
+            output_bytes = buffer.getvalue()
+
+            if len(images) > 1:
+                new_filename = f"{stem}_part{i + 1}.jpg"
+                details_parts.insert(0, f"split part {i + 1}/{len(images)}")
+            else:
+                new_filename = f"{stem}.jpg"
+
+            results.append(ImageResult(
+                output_bytes=output_bytes,
+                new_filename=new_filename,
+                original_size=original_size if i == 0 else 0,
+                new_size=len(output_bytes),
+                was_converted=True,
+                details=", ".join(details_parts) if details_parts else "baseline JPEG"
+            ))
+    finally:
+        opened_img.close()
 
     return results
 
